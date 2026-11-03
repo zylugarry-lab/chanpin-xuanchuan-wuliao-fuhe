@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>产品宣传物料复核</title>
+  <link rel="stylesheet" href="styles.css" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+</head>
+<body>
+  <header class="top">
+    <div>
+      <p class="eyebrow">Word 稿 × PDF 成品</p>
+      <h1>产品宣传物料复核</h1>
+    </div>
+    <p class="lede">文件只在这台浏览器里处理，不会上传。对照的是文字层：正文、表格和数字。扫描件、转成曲线的标题，这一页对不到。</p>
+  </header>
+
+  <main>
+    <section class="picker">
+      <label class="drop" id="word-drop">
+        <span class="drop-kicker">Word 稿</span>
+        <strong id="word-name">选择 .docx</strong>
+        <span class="drop-hint">含修订时按接受后的正文</span>
+        <input id="word-file" type="file" accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document" hidden />
+      </label>
+      <label class="drop" id="pdf-drop">
+        <span class="drop-kicker">PDF 成品</span>
+        <strong id="pdf-name">选择 .pdf</strong>
+        <span class="drop-hint">使用文件里的可选中文字</span>
+        <input id="pdf-file" type="file" accept=".pdf,application/pdf" hidden />
+      </label>
+    </section>
+
+    <div class="actions">
+      <label class="name-field">物料名称
+        <input id="material-name" type="text" placeholder="例如 中证1000指增" />
+      </label>
+      <button id="run" type="button" disabled>开始对照</button>
+      <button id="export" type="button" class="ghost" hidden>下载表格</button>
+    </div>
+
+    <p id="status" class="status" role="status"></p>
+    <div id="warn" class="warn" hidden></div>
+
+    <section id="results" hidden>
+      <div class="stats" id="stats"></div>
+      <div class="filters" id="filters"></div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>类别</th>
+              <th>Word 稿</th>
+              <th>PDF 成品</th>
+              <th>说明</th>
+              <th>复核意见</th>
+            </tr>
+          </thead>
+          <tbody id="rows"></tbody>
+        </table>
+      </div>
+      <section id="matched-wrap" class="matched">
+        <h2>已对齐，不作为差异</h2>
+        <p id="matched"></p>
+      </section>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
