@@ -127,6 +127,7 @@ table { width: 100%; border-collapse: collapse; font-size: 14px; }
 th, td { padding: 12px 14px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--line); }
 th { background: var(--navy); color: white; font-weight: 600; white-space: nowrap; }
 tr.body td:first-child { background: var(--amber); }
+tr.picture td:first-child { background: #f3e9f8; }
 tr.extra td:first-child { background: var(--blue); }
 tr.missing td:first-child { background: #f7f1ea; }
 mark { background: var(--mark); color: inherit; padding: 0 2px; }

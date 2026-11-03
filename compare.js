@@ -146,7 +146,7 @@ function locate(nc, full) {
 function lcsDiff(a, b) {
   const m = a.length;
   const n = b.length;
-  if (m > 180 || n > 200) return null;
+  if (m > 260 || n > 280) return null;
   const dp = Array.from({ length: m + 1 }, () => new Uint16Array(n + 1));
   for (let i = m - 1; i >= 0; i--) {
     for (let j = n - 1; j >= 0; j--) {
@@ -172,9 +172,10 @@ function lcsDiff(a, b) {
   while (i < m) aMarks[i++] = true;
   while (j < n) bMarks[j++] = true;
   const changed = aMarks.some(Boolean) || bMarks.some(Boolean);
+  const meaningfulChar = /[\u4e00-\u9fff0-9%.,;:，。；：、]/;
   const meaningful =
-    [...a].some((ch, idx) => aMarks[idx] && /[\u4e00-\u9fff0-9%]/.test(ch)) ||
-    [...b].some((ch, idx) => bMarks[idx] && /[\u4e00-\u9fff0-9%]/.test(ch));
+    [...a].some((ch, idx) => aMarks[idx] && meaningfulChar.test(ch)) ||
+    [...b].some((ch, idx) => bMarks[idx] && meaningfulChar.test(ch));
   return { changed, meaningful, aMarks, bMarks };
 }
 
@@ -568,11 +569,83 @@ function signFindings(wordText, pdfText) {
   return rows;
 }
 
+function strictText(value) {
+  return String(value || "")
+    .replace(/\s+/g, "")
+    .replace(/[（(]/g, "(")
+    .replace(/[）)]/g, ")");
+}
+
+function markedCount(text, marks) {
+  let count = 0;
+  const meaningfulChar = /[\u4e00-\u9fff0-9%.,;:，。；：、]/;
+  for (let i = 0; i < text.length; i++) {
+    if (marks[i] && meaningfulChar.test(text[i])) count++;
+  }
+  return count;
+}
+
+function shortLabelsFromLines(lines) {
+  const out = [];
+  const seen = new Set();
+  (lines || []).forEach((line) => {
+    const text = cleanLabel(line);
+    const n = norm(text);
+    if (!isLabel(text) || n.length < 2 || n.length > 16 || seen.has(n)) return;
+    seen.add(n);
+    out.push(text);
+  });
+  return out;
+}
+
+function shortLabelsFromItems(items) {
+  const byPage = new Map();
+  (items || []).forEach((item) => {
+    const page = item.page || 1;
+    if (!byPage.has(page)) byPage.set(page, []);
+    byPage.get(page).push(item);
+  });
+  const out = [];
+  const seen = new Set();
+  byPage.forEach((list) => {
+    verticalJoin(list).forEach((item) => {
+      const text = cleanLabel(item.str);
+      const n = norm(text);
+      if (!isLabel(text) || n.length < 2 || n.length > 16 || seen.has(n)) return;
+      const isolated = !list.some((other) => {
+        const sameSpot = Math.abs(other.y - item.y) < 1 && Math.abs(other.x - item.x) < 1 && norm(other.str) === n;
+        if (sameSpot) return false;
+        return Math.abs(other.y - item.y) < 18 && Math.abs(other.x - item.x) < 70;
+      });
+      seen.add(n);
+      out.push({ text, isolated });
+    });
+  });
+  return out;
+}
+
+function onlyInsideLongerWord(blob, label) {
+  const n = norm(label);
+  if (!n || !blob.includes(n)) return false;
+  let index = 0;
+  let inside = false;
+  let alone = false;
+  while ((index = blob.indexOf(n, index)) >= 0) {
+    const next = blob[index + n.length] || "";
+    if (/[\u4e00-\u9fff]/.test(next)) inside = true;
+    else alone = true;
+    index += n.length;
+  }
+  return inside && !alone;
+}
+
 function compare(word, pdf, ocrGroups) {
   const wordText = word.text || "";
   const pdfText = pdf.text || "";
+  const ocrText = word.ocrText || "";
   const wn = norm(wordText);
   const pn = norm(pdfText);
+  const wnWithOcr = norm(wordText + "\n" + ocrText);
   const findings = [];
   const seen = new Set();
 
@@ -622,6 +695,173 @@ function compare(word, pdf, ocrGroups) {
     );
   });
 
+  const wordShort = shortLabelsFromLines([].concat(word.lines || [], ocrText.split("\n")));
+  const pdfShort = shortLabelsFromItems(pdf.items || []);
+  wordShort.forEach((label) => {
+    const n = norm(label);
+    if (pn.includes(n)) return;
+    let best = null;
+    pdfShort.forEach((item) => {
+      const score = sim(n, norm(item.text));
+      if (!best || score > best.score) best = { text: item.text, score };
+    });
+    if (!best || best.score < 0.8 || best.score >= 0.98 || Math.abs(norm(best.text).length - n.length) > 4) return;
+    const left = n.length >= norm(best.text).length ? n : norm(best.text);
+    const right = n.length >= norm(best.text).length ? norm(best.text) : n;
+    const rest = left.includes(right) ? left.replace(right, "") : left;
+    if (!/[\u4e00-\u9fff0-9]/.test(rest)) return;
+    push(
+      "正文不一致",
+      label,
+      best.text,
+      "短标题不一致。稿和成品各自单独写着这几个字，其中有改动。",
+      null,
+      null,
+      { focus: best.text, pdfHints: [best.text] },
+    );
+  });
+  pdfShort.forEach((item) => {
+    const n = norm(item.text);
+    if (n.length < 2 || n.length > 4 || !item.isolated) return;
+    if (wordShort.some((label) => norm(label) === n)) return;
+    if (!onlyInsideLongerWord(wnWithOcr, item.text)) return;
+    push(
+      "成品多写",
+      "（稿里这几个字只出现在更长的词里）",
+      item.text,
+      "成品单独写出了这个短标签。",
+      null,
+      null,
+      { focus: item.text, pdfHints: [item.text] },
+    );
+  });
+  (ocrGroups || []).forEach((group) => {
+    const labels = groupLabels(group);
+    labels.forEach((label) => {
+      const n = norm(label);
+      if (n.length < 4 || pn.includes(n)) return;
+      let hit = 0;
+      const total = n.length - 3;
+      for (let i = 0; i < total; i++) {
+        if (pn.includes(n.slice(i, i + 4))) hit++;
+      }
+      if (total > 0 && hit / total >= 0.34) return;
+      push(
+        "图片不一致",
+        label,
+        "（成品文字层里没有这几个字）",
+        "这几个字在稿的图片上，成品文字层里没有。",
+        null,
+        null,
+        { imageId: group.imageId, focus: label, pdfHints: [label] },
+      );
+    });
+  });
+
+  const pdfStrict = strictText(pdfText);
+  sentences(wordText).forEach(({ raw, n }) => {
+    if (!pn.includes(n)) return;
+    if (pdfStrict.includes(strictText(raw))) return;
+    push("正文不一致", raw, "（同一句里标点不同）", "标点不一致。字对得上，句号、逗号或分号对不上。");
+  });
+
+  const pdfLines = String(pdfText).replace(/[ \t\u3000]+/g, "");
+  const wordLines = String(wordText).replace(/[ \t\u3000]+/g, "");
+  const ownLine = (extra) => (word.lines || []).some((line) => norm(line) === norm(extra));
+  wordText.split(/[。\n；]/).forEach((raw) => {
+    const probe = raw.replace(/[ \t\u3000]+/g, "").trim();
+    if (probe.length < 6 || probe.length > 40) return;
+    const atWord = wordLines.indexOf(probe);
+    if (atWord < 0) return;
+    const follow = wordLines.slice(atWord + probe.length, atWord + probe.length + 4);
+    if (follow.length < 2) return;
+    let from = 0;
+    let index = -1;
+    let bare = false;
+    let extraHit = "";
+    while ((index = pdfLines.indexOf(probe, from)) >= 0) {
+      const gotFollow = pdfLines.slice(index + probe.length, index + probe.length + follow.length);
+      if (gotFollow !== follow) {
+        from = index + probe.length;
+        continue;
+      }
+      const lineStart = pdfLines.lastIndexOf("\n", index - 1) + 1;
+      let start = index;
+      while (start > lineStart && index - start < 4 && /[\u4e00-\u9fff]/.test(pdfLines[start - 1])) start--;
+      const extra = pdfLines.slice(start, index);
+      const prev = start === lineStart ? "\n" : pdfLines[start - 1];
+      const boundary = start === lineStart || /[。.;；,，:：、（(]/.test(prev);
+      const wordPrefix = wordLines.slice(Math.max(0, atWord - extra.length), atWord);
+      if (!extra || !boundary || ownLine(extra) || wordPrefix === extra) bare = true;
+      else if (!extraHit) extraHit = extra;
+      from = index + probe.length;
+    }
+    if (bare || !extraHit) return;
+    push(
+      "正文不一致",
+      probe.slice(0, 40),
+      extraHit + probe.slice(0, 24),
+      "这句前面多了「" + extraHit + "」。",
+      null,
+      null,
+      { focus: extraHit, pdfHints: [extraHit] },
+    );
+  });
+
+  wordText.split("\n").forEach((line) => {
+    const matched = line.trim().match(/(.{8,18})([。；])\s*$/);
+    if (!matched) return;
+    const tail = matched[1].replace(/[ \t\u3000]+/g, "");
+    const punct = matched[2];
+    const expected = punct === "。" ? /[。.]/ : /[；;]/;
+    const hits = [];
+    pdfText.split("\n").forEach((pdfLine) => {
+      const text = pdfLine.replace(/[ \t\u3000]+/g, "");
+      const at = text.lastIndexOf(tail);
+      if (at < 0) return;
+      if (text.slice(at + tail.length + 1).replace(/\s/g, "")) return;
+      hits.push(text[at + tail.length] || "");
+    });
+    if (!hits.length || hits.some((ch) => expected.test(ch))) return;
+    const other = hits.find((ch) => /[。.;；]/.test(ch));
+    if (!other) return;
+    push(
+      "正文不一致",
+      tail.slice(-8) + punct,
+      tail.slice(-8) + other,
+      "句末标点不一致。",
+      null,
+      null,
+      { focus: tail.slice(-6), pdfHints: [tail.slice(-6)] },
+    );
+  });
+
+  const ending = /([^。；\n]{6,80})([。；])/g;
+  let endingMatch;
+  while ((endingMatch = ending.exec(wordText))) {
+    const clause = strictText(endingMatch[1]).slice(-12);
+    const punct = endingMatch[2];
+    if (clause.length < 6) continue;
+    const at = pdfStrict.indexOf(clause);
+    if (at < 0) continue;
+    const next = pdfStrict[at + clause.length] || "";
+    const expected = punct === "。" ? /[。.]/ : /[；;]/;
+    if (expected.test(next)) continue;
+    const after = strictText(wordText.slice(endingMatch.index + endingMatch[0].length)).slice(0, 4);
+    const swapped = /[。.;；]/.test(next) && after && pdfStrict.startsWith(after, at + clause.length + 1);
+    const omitted = /[\u4e00-\u9fff]/.test(next) && after && pdfStrict.startsWith(after, at + clause.length);
+    if (!swapped && !omitted) continue;
+    push(
+      "正文不一致",
+      clause.slice(-8) + punct,
+      clause.slice(-8) + (next || after),
+      omitted ? "这里少了句末的" + punct + "。" : "句末标点不一致。",
+      null,
+      null,
+      { focus: clause.slice(-6), pdfHints: [clause.slice(-6)] },
+    );
+  }
+
   const sentenceFindings = [];
   function pushSentence(kind, wordSide, pdfSide, note, wordHtml, pdfHtml) {
     const key = kind + "|" + norm(wordSide) + "|" + norm(pdfSide);
@@ -640,10 +880,11 @@ function compare(word, pdf, ocrGroups) {
   sentences(wordText).forEach(({ raw, n }) => {
     if (pn.includes(n)) return;
     const cover = coverage(n, pn);
-    if (cover >= 0.93) return;
     const win = locate(n, pn);
     const diff = win ? lcsDiff(n, win.slice(0, n.length + 4)) : null;
-    if (diff && diff.changed && diff.meaningful && cover >= 0.55) {
+    const smallEdit = diff && diff.changed && diff.meaningful && markedCount(n, diff.aMarks) > 0 && markedCount(n, diff.aMarks) <= 6;
+    if (cover >= 0.93 && !smallEdit) return;
+    if (diff && diff.changed && diff.meaningful && (cover >= 0.55 || smallEdit)) {
       pushSentence(
         "正文不一致",
         raw,
@@ -660,12 +901,15 @@ function compare(word, pdf, ocrGroups) {
   });
 
   sentences(pdfText).forEach(({ raw, n }) => {
-    if (wn.includes(n)) return;
+    if (wnWithOcr.includes(n)) return;
     const han = (n.match(/[\u4e00-\u9fff]/g) || []).length;
     if (han < 4) return;
-    const cover = coverage(n, wn);
+    const cover = coverage(n, wnWithOcr);
     if (cover >= 0.9) return;
     if (cover < 0.4) {
+      const ocrLabels = (ocrText.match(/[\u4e00-\u9fff]{4,}/g) || []).map((label) => norm(label));
+      const shared = ocrLabels.filter((label) => n.includes(label)).length;
+      if (shared >= 2) return;
       pushSentence("成品多写", "（稿里没有这句）", raw, "成品文字层里有，稿里没有。图注和脚注经常落在这里。");
     }
   });

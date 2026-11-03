@@ -55,9 +55,11 @@ runBtn.addEventListener("click", async () => {
     let ocrGroups = [];
     if (word.images.length) {
       try {
-        ocrGroups = await ocrImages(word.images, (message) => {
+        const ocr = await ocrImages(word.images, (message) => {
           statusEl.textContent = message;
         });
+        ocrGroups = ocr.groups;
+        word.ocrText = ocr.text;
       } catch (err) {
         warnEl.hidden = false;
         warnEl.textContent = "稿里的图片这次没有识别成文字，图例可能对不到。表格和正文仍按文字层对照。";
@@ -127,6 +129,13 @@ async function readDocx(file) {
     const text = texts.join("").replace(/\s+/g, " ").trim();
     if (text) lines.push(text);
   });
+  for (const diagram of zip.file(/^word\/diagrams\/data\d+\.xml$/) || []) {
+    const diagramXml = await diagram.async("string");
+    const labels = [...diagramXml.matchAll(/<a:t[^>]*>([^<]*)<\/a:t>/g)]
+      .map((match) => decodeXml(match[1]).replace(/\s+/g, "").trim())
+      .filter(Boolean);
+    labels.forEach((label) => lines.push(label));
+  }
   const chartGroups = [];
   const seenCharts = new Set();
   for (const chart of zip.file(/^word\/charts\/chart\d+\.xml$/) || []) {
@@ -187,29 +196,31 @@ async function ocrImages(images, onStatus) {
     langPath: "https://tessdata.projectnaptha.com/4.0.0_fast",
   });
   const groups = [];
+  const texts = [];
   try {
     for (let i = 0; i < images.length; i++) {
       onStatus(`正在识别稿里的图片（${i + 1}/${images.length}）…`);
       const { data } = await worker.recognize(new Blob([images[i]]));
       const labels = [];
       (data.lines || []).forEach((line) => {
-        if (line.confidence < 55) return;
+        if (line.confidence < 45) return;
+        if (line.text) texts.push(line.text);
         extractLabels(line.text || "").forEach((label) => {
           if (!labels.includes(label)) labels.push(label);
         });
       });
-      if (labels.length >= 2) groups.push({ labels: labels.slice(0, 8), imageId: i });
+      if (labels.length >= 2) groups.push({ labels: labels.slice(0, 12), imageId: i });
     }
   } finally {
     await worker.terminate();
   }
-  return groups;
+  return { groups, text: texts.join("\n") };
 }
 
 async function attachPdfShots(pdfDoc, items, rows) {
   const cache = new Map();
   for (const row of rows) {
-    const showShot = row.note.indexOf("图例") === 0 || row.note.indexOf("正负号") === 0;
+    const showShot = /^(图例|正负号|短标题|标点|这几个字在稿的图片|这句前面|这里少了|句末|成品单独写出)/.test(row.note);
     if (!row.focus || !showShot) continue;
     const box = locateCluster(items, row.pdfHints, row.focus);
     if (!box) continue;
@@ -250,9 +261,10 @@ function shotHtml(url, caption) {
 }
 
 function render() {
-  const kinds = ["全部", "正文不一致", "成品多写", "稿有成品无"];
+  const kinds = ["全部", "正文不一致", "图片不一致", "成品多写", "稿有成品无"];
   const counts = {
     正文不一致: findings.filter((f) => f.kind === "正文不一致").length,
+    图片不一致: findings.filter((f) => f.kind === "图片不一致").length,
     成品多写: findings.filter((f) => f.kind === "成品多写").length,
     稿有成品无: findings.filter((f) => f.kind === "稿有成品无").length,
   };
@@ -269,7 +281,7 @@ function render() {
     });
   });
   const view = findings.filter((f) => filter === "全部" || f.kind === filter);
-  const cls = { 正文不一致: "body", 成品多写: "extra", 稿有成品无: "missing" };
+  const cls = { 正文不一致: "body", 图片不一致: "picture", 成品多写: "extra", 稿有成品无: "missing" };
   rowsEl.innerHTML = view
     .map(
       (f) => `<tr class="${cls[f.kind] || ""}">
