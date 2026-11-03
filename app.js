@@ -42,16 +42,27 @@ runBtn.addEventListener("click", async () => {
   statusEl.textContent = "正在抽取文字…";
   warnEl.hidden = true;
   try {
-    const [wordText, pdfText] = await Promise.all([
+    const [word, pdf] = await Promise.all([
       readDocx(wordInput.files[0]),
       readPdf(pdfInput.files[0]),
     ]);
-    if (pdfText.replace(/\s/g, "").length < 40) {
+    if (pdf.text.replace(/\s/g, "").length < 40) {
       warnEl.hidden = false;
       warnEl.textContent =
         "这份 PDF 几乎没有可选中的文字，多半是扫描件或整页图片。网页只能对文字层，这种文件对出来会是空的或不可靠。";
     }
-    const result = compare(wordText, pdfText);
+    let ocrGroups = [];
+    if (word.images.length) {
+      try {
+        ocrGroups = await ocrImages(word.images, (message) => {
+          statusEl.textContent = message;
+        });
+      } catch (err) {
+        warnEl.hidden = false;
+        warnEl.textContent = "稿里的图片这次没有识别成文字，图例可能对不到。表格和正文仍按文字层对照。";
+      }
+    }
+    const result = compare(word, pdf, ocrGroups);
     findings = result.findings;
     matchedText = result.matched;
     filter = "全部";
@@ -102,26 +113,51 @@ async function readDocx(file) {
   if (!fileXml) throw new Error("这不是可读取的 docx");
   let xml = await fileXml.async("string");
   xml = xml.replace(/<w:del\b[^>]*>[\s\S]*?<\/w:del>/g, "");
-  const parts = [];
+  const lines = [];
   xml.split("</w:p>").forEach((chunk) => {
     const texts = [...chunk.matchAll(/<w:t[^>]*>([^<]*)<\/w:t>/g)].map((m) => decodeXml(m[1]));
     const text = texts.join("").replace(/\s+/g, " ").trim();
-    if (text) parts.push(text);
+    if (text) lines.push(text);
   });
-  return parts.join("\n");
+  const chartGroups = [];
+  const seenCharts = new Set();
+  for (const chart of zip.file(/^word\/charts\/chart\d+\.xml$/) || []) {
+    const chartXml = await chart.async("string");
+    extractChartGroups(chartXml).forEach((group) => {
+      const key = group.join("\n");
+      if (seenCharts.has(key)) return;
+      seenCharts.add(key);
+      chartGroups.push(group);
+    });
+  }
+  const images = [];
+  for (const media of zip.file(/^word\/media\/.+\.(png|jpe?g)$/i) || []) {
+    const bytes = await media.async("uint8array");
+    if (bytes.byteLength >= 20000) images.push(bytes);
+  }
+  return { text: lines.join("\n"), lines, chartGroups, images };
 }
 
 async function readPdf(file) {
   const data = new Uint8Array(await file.arrayBuffer());
   const pdf = await pdfjsLib.getDocument({ data }).promise;
   const pages = [];
+  const items = [];
   for (let i = 1; i <= pdf.numPages; i++) {
     const page = await pdf.getPage(i);
+    const viewport = page.getViewport({ scale: 1 });
     const content = await page.getTextContent();
     let line = "";
     const lines = [];
     content.items.forEach((item) => {
-      if (!item.str) return;
+      if (!item.str || !item.str.trim()) return;
+      items.push({
+        str: item.str.trim(),
+        x: item.transform[4],
+        y: viewport.height - item.transform[5],
+        w: item.width || Math.max(8, item.str.length * 6),
+        page: i,
+      });
       line += item.str;
       if (item.hasEOL) {
         lines.push(line);
@@ -131,189 +167,34 @@ async function readPdf(file) {
     if (line) lines.push(line);
     pages.push(lines.join("\n"));
   }
-  return pages.join("\n");
+  return { text: pages.join("\n"), items };
 }
 
-function decodeXml(s) {
-  return s
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'")
-    .replace(/&amp;/g, "&");
-}
-
-function norm(s) {
-  return s
-    .replace(/\s+/g, "")
-    .replace(/[，]/g, ",")
-    .replace(/[。]/g, ".")
-    .replace(/[：]/g, ":")
-    .replace(/[；]/g, ";")
-    .replace(/[（]/g, "(")
-    .replace(/[）]/g, ")")
-    .replace(/[“”]/g, '"')
-    .replace(/[‘’]/g, "'")
-    .replace(/[、]/g, ",")
-    .replace(/[—–－]/g, "-")
-    .replace(/[×]/g, "x")
-    .replace(/[％]/g, "%")
-    .replace(/[·・]/g, ".")
-    .replace(/[【]/g, "[")
-    .replace(/[】]/g, "]");
-}
-
-function sentences(text) {
-  const seen = new Set();
-  const out = [];
-  text.split(/[。\n；]/).forEach((raw) => {
-    const clean = raw.trim().replace(/^[|\s]+|[|\s]+$/g, "");
-    const n = norm(clean);
-    if (n.length < 10 || seen.has(n)) return;
-    const han = (n.match(/[\u4e00-\u9fff]/g) || []).length;
-    if (han < 4 && !/\d/.test(n)) return;
-    seen.add(n);
-    out.push({ raw: clean, n });
+async function ocrImages(images, onStatus) {
+  if (typeof Tesseract === "undefined") throw new Error("识别组件没有加载");
+  const worker = await Tesseract.createWorker("chi_sim", 1, {
+    workerPath: "https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/worker.min.js",
+    corePath: "https://cdn.jsdelivr.net/npm/tesseract.js-core@5.1.1",
+    langPath: "https://tessdata.projectnaptha.com/4.0.0_fast",
   });
-  return out;
-}
-
-function coverage(nc, full) {
-  if (full.includes(nc)) return 1;
-  if (nc.length < 8) return 0;
-  let hit = 0;
-  const total = nc.length - 7;
-  for (let i = 0; i < total; i++) {
-    if (full.includes(nc.slice(i, i + 8))) hit++;
+  const groups = [];
+  try {
+    for (let i = 0; i < images.length; i++) {
+      onStatus(`正在识别稿里的图片（${i + 1}/${images.length}）…`);
+      const { data } = await worker.recognize(new Blob([images[i]]));
+      const labels = [];
+      (data.lines || []).forEach((line) => {
+        if (line.confidence < 55) return;
+        extractLabels(line.text || "").forEach((label) => {
+          if (!labels.includes(label)) labels.push(label);
+        });
+      });
+      if (labels.length >= 2) groups.push(labels.slice(0, 8));
+    }
+  } finally {
+    await worker.terminate();
   }
-  return hit / total;
-}
-
-function locate(nc, full) {
-  let best = null;
-  const width = Math.min(10, nc.length);
-  for (let i = 0; i + width <= nc.length; i++) {
-    const j = full.indexOf(nc.slice(i, i + width));
-    if (j >= 0) {
-      best = { i, j, len: width };
-      break;
-    }
-  }
-  if (!best) return "";
-  const start = Math.max(0, best.j - best.i);
-  return full.slice(start, start + nc.length + 8);
-}
-
-function lcsDiff(a, b) {
-  const m = a.length;
-  const n = b.length;
-  if (m > 180 || n > 200) return null;
-  const dp = Array.from({ length: m + 1 }, () => new Uint16Array(n + 1));
-  for (let i = m - 1; i >= 0; i--) {
-    for (let j = n - 1; j >= 0; j--) {
-      dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
-    }
-  }
-  const aMarks = Array(m).fill(false);
-  const bMarks = Array(n).fill(false);
-  let i = 0;
-  let j = 0;
-  while (i < m && j < n) {
-    if (a[i] === b[j]) {
-      i++;
-      j++;
-    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
-      aMarks[i] = true;
-      i++;
-    } else {
-      bMarks[j] = true;
-      j++;
-    }
-  }
-  while (i < m) aMarks[i++] = true;
-  while (j < n) bMarks[j++] = true;
-  const changed = aMarks.some(Boolean) || bMarks.some(Boolean);
-  const meaningful = [...a].some((ch, idx) => aMarks[idx] && /[\u4e00-\u9fff0-9%]/.test(ch))
-    || [...b].some((ch, idx) => bMarks[idx] && /[\u4e00-\u9fff0-9%]/.test(ch));
-  return { changed, meaningful, aMarks, bMarks };
-}
-
-function paint(text, marks) {
-  let html = "";
-  let open = false;
-  for (let i = 0; i < text.length; i++) {
-    if (marks[i] && !open) {
-      html += "<mark>";
-      open = true;
-    } else if (!marks[i] && open) {
-      html += "</mark>";
-      open = false;
-    }
-    html += escapeHtml(text[i]);
-  }
-  if (open) html += "</mark>";
-  return html;
-}
-
-function escapeHtml(s) {
-  return s.replace(/[&<>]/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[ch]));
-}
-
-function compare(wordText, pdfText) {
-  const wn = norm(wordText);
-  const pn = norm(pdfText);
-  const findings = [];
-  const seen = new Set();
-
-  function push(kind, word, pdf, note, wordHtml, pdfHtml) {
-    const key = kind + "|" + norm(word) + "|" + norm(pdf);
-    if (seen.has(key)) return;
-    seen.add(key);
-    findings.push({ kind, word, pdf, note, wordHtml: wordHtml || escapeHtml(word), pdfHtml: pdfHtml || escapeHtml(pdf) });
-  }
-
-  sentences(wordText).forEach(({ raw, n }) => {
-    if (pn.includes(n)) return;
-    const cover = coverage(n, pn);
-    if (cover >= 0.93) return;
-    const win = locate(n, pn);
-    const diff = win ? lcsDiff(n, win.slice(0, n.length + 4)) : null;
-    if (diff && diff.changed && diff.meaningful && cover >= 0.55) {
-      push(
-        "正文不一致",
-        raw,
-        win,
-        "同一句里有字不一样，标出的是不同的地方。",
-        paint(n, diff.aMarks),
-        paint(win.slice(0, diff.bMarks.length), diff.bMarks),
-      );
-      return;
-    }
-    if (cover < 0.45) {
-      push("稿有成品无", raw, "（成品文字层里没有这句）", "稿里有，成品文字层里对不上。转曲标题可能其实印在版面上。");
-    }
-  });
-
-  sentences(pdfText).forEach(({ raw, n }) => {
-    if (wn.includes(n)) return;
-    const han = (n.match(/[\u4e00-\u9fff]/g) || []).length;
-    if (han < 4) return;
-    const cover = coverage(n, wn);
-    if (cover >= 0.9) return;
-    if (cover < 0.4) {
-      push("成品多写", "（稿里没有这句）", raw, "成品文字层里有，稿里没有。图注和脚注经常落在这里。");
-    }
-  });
-
-  const numRe = /\d+(?:\.\d+)?%|\d{4}[./年]\d{1,2}(?:[./月]\d{1,2}日?)?|\d{6}/g;
-  const wordNums = new Set(wordText.match(numRe) || []);
-  const pdfNums = new Set(pdfText.match(numRe) || []);
-  const both = [...wordNums].filter((n) => pdfNums.has(n));
-  both.sort();
-  return {
-    findings: findings.slice(0, 80),
-    matched: both.length ? both.slice(0, 40).join("、") : "没有抽出两边都出现的百分比、日期或六位代码。",
-  };
+  return groups;
 }
 
 function render() {
