@@ -131,6 +131,28 @@ tr.extra td:first-child { background: var(--blue); }
 tr.missing td:first-child { background: #f7f1ea; }
 mark { background: var(--mark); color: inherit; padding: 0 2px; }
 td select { font: inherit; padding: 6px; border: 1px solid var(--line); background: #fffdf6; width: 118px; }
+.shot { margin: 10px 0 0; }
+.shot img {
+  display: block;
+  max-width: min(360px, 100%);
+  max-height: 220px;
+  background: white;
+  border: 1px solid var(--line);
+  cursor: zoom-in;
+}
+.shot figcaption { margin-top: 4px; color: var(--muted); font-size: 12px; }
+.lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(22, 28, 34, 0.72);
+}
+.lightbox[hidden] { display: none; }
+.lightbox img { max-width: 92vw; max-height: 90vh; background: white; cursor: zoom-out; }
 
 .matched { margin: 22px 0 48px; }
 .matched h2 { font-size: 18px; margin: 0 0 8px; font-family: "Songti SC", serif; font-weight: 600; }

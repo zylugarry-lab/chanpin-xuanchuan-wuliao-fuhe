@@ -397,21 +397,109 @@ function sameGroup(word, pdf) {
   return word.every((s) => pn.includes(norm(cleanLabel(s))));
 }
 
+function groupLabels(group) {
+  return Array.isArray(group) ? group : group.labels || [];
+}
+
 function labelFindings(wordGroups, groups) {
   const found = [];
   wordGroups.forEach((group) => {
+    const labels = groupLabels(group);
+    const imageId = Array.isArray(group) ? null : group.imageId;
     let best = null;
     groups.forEach((pdfGroup) => {
-      const assigned = assign(group, pdfGroup);
-      if (assigned && (!best || assigned.score > best.score)) best = assigned;
+      const assigned = assign(labels, pdfGroup);
+      if (assigned && (!best || assigned.score > best.score)) best = Object.assign({ pdfLabels: pdfGroup }, assigned);
     });
     if (!best) return;
     best.reports.forEach((row) => {
       if (row.s >= 0.98) return;
-      found.push(row);
+      found.push({
+        word: row.word,
+        pdf: row.pdf,
+        s: row.s,
+        imageId: imageId == null ? null : imageId,
+        pdfHints: best.pdfLabels,
+      });
     });
   });
   return found;
+}
+
+function clusterText(value) {
+  return norm(String(value || "").replace(/^[•·●▪►\s]+/, "").trim());
+}
+
+function locateCluster(items, hints, focus) {
+  const focusN = clusterText(focus || "");
+  if (!focusN) return null;
+  const wanted = [];
+  []
+    .concat(hints || [], [focus])
+    .forEach((label) => {
+      const text = clusterText(label || "");
+      if (text.length >= 2 && !wanted.includes(text)) wanted.push(text);
+    });
+  const byPage = new Map();
+  (items || []).forEach((item) => {
+    const page = item.page || 1;
+    if (!byPage.has(page)) byPage.set(page, []);
+    byPage.get(page).push(item);
+  });
+  let best = null;
+  byPage.forEach((list, page) => {
+    list.forEach((anchor) => {
+      const anchorText = clusterText(anchor.str);
+      if (!anchorText || anchorText.length > focusN.length + 6) return;
+      if (anchorText !== focusN && !anchorText.includes(focusN) && !focusN.includes(anchorText)) return;
+      const near = list.filter((item) => Math.abs(item.x - anchor.x) < 240 && Math.abs(item.y - anchor.y) < 90);
+      const matched = near.filter((item) => {
+        const text = clusterText(item.str);
+        return wanted.some((label) => text && text.length <= label.length + 6 && (text === label || text.includes(label) || label.includes(text)));
+      });
+      const used = matched.length ? matched : [anchor];
+      let covered = 0;
+      wanted.forEach((label) => {
+        if (used.some((item) => {
+          const text = clusterText(item.str);
+          return text === label || (text && text.length <= label.length + 6 && (text.includes(label) || label.includes(text)));
+        })) covered++;
+      });
+      let top = Infinity;
+      let left = Infinity;
+      let right = -Infinity;
+      let bottom = -Infinity;
+      used.forEach((item) => {
+        const height = item.h || 10;
+        top = Math.min(top, item.y - height);
+        bottom = Math.max(bottom, item.y + 3);
+        left = Math.min(left, item.x);
+        right = Math.max(right, item.x + (item.w || 20));
+      });
+      const area = Math.max(1, right - left) * Math.max(1, bottom - top);
+      const score = covered * 1000 + (anchorText === focusN ? 20 : 0) - area / 800;
+      if (best && score <= best.score) return;
+      const pad = 16;
+      best = {
+        score,
+        page,
+        x: Math.max(0, left - pad),
+        y: Math.max(0, top - pad),
+        w: right - left + pad * 2,
+        h: bottom - top + pad * 2,
+      };
+    });
+  });
+  if (!best) return null;
+  if (best.w < 160) {
+    best.x = Math.max(0, best.x - (160 - best.w) / 2);
+    best.w = 160;
+  }
+  if (best.h < 76) {
+    best.y = Math.max(0, best.y - (76 - best.h));
+    best.h = 76;
+  }
+  return best;
 }
 
 function signedPercents(text) {
@@ -472,6 +560,7 @@ function signFindings(wordText, pdfText) {
       word: snippetAt(wordText, wordTok.index, wordTok.raw.length),
       pdf: snippetAt(pdfText, pdfTok.index, pdfTok.raw.length),
       note: "正负号不一致。稿里是 " + wordTok.raw + "，成品是 " + pdfTok.raw + "。",
+      focus: pdfTok.raw,
     });
   }
   pdf.forEach((token) => consider(token, wordSet, word, true));
@@ -487,10 +576,16 @@ function compare(word, pdf, ocrGroups) {
   const findings = [];
   const seen = new Set();
 
-  function push(kind, wordSide, pdfSide, note, wordHtml, pdfHtml) {
+  function push(kind, wordSide, pdfSide, note, wordHtml, pdfHtml, extra) {
     const key = kind + "|" + norm(wordSide) + "|" + norm(pdfSide);
-    if (seen.has(key)) return;
     if (!norm(wordSide) && !norm(pdfSide)) return;
+    if (seen.has(key)) {
+      if (extra && extra.imageId != null) {
+        const prev = findings.find((row) => norm(row.word) === norm(wordSide) && norm(row.pdf) === norm(pdfSide));
+        if (prev && prev.imageId == null) prev.imageId = extra.imageId;
+      }
+      return;
+    }
     seen.add(key);
     findings.push({
       kind,
@@ -499,25 +594,31 @@ function compare(word, pdf, ocrGroups) {
       note,
       wordHtml: wordHtml || escapeHtml(wordSide),
       pdfHtml: pdfHtml || escapeHtml(pdfSide),
+      imageId: extra && extra.imageId != null ? extra.imageId : null,
+      pdfHints: (extra && extra.pdfHints) || [],
+      focus: (extra && extra.focus) || pdfSide,
     });
   }
 
   signFindings(wordText, pdfText).forEach((row) => {
-    push("正文不一致", row.word, row.pdf, row.note);
+    push("正文不一致", row.word, row.pdf, row.note, null, null, { focus: row.focus, pdfHints: [row.focus] });
   });
 
   const groups = []
-    .concat(lineGroups(word.lines || []))
+    .concat(ocrGroups || [])
     .concat(word.chartGroups || [])
-    .concat(ocrGroups || []);
+    .concat(lineGroups(word.lines || []));
   const pdfSide = pdfGroups(pdf.items || []);
-  const openGroups = groups.filter((group) => !pdfSide.some((pdfGroup) => sameGroup(group, pdfGroup)));
+  const openGroups = groups.filter((group) => !pdfSide.some((pdfGroup) => sameGroup(groupLabels(group), pdfGroup)));
   labelFindings(openGroups, pdfSide).forEach((row) => {
     push(
       "正文不一致",
       row.word,
       row.pdf,
       "图例或表头名称不一致。两边挨在一起的一组名称里，这一项对不上。",
+      null,
+      null,
+      { imageId: row.imageId, pdfHints: row.pdfHints, focus: row.pdf },
     );
   });
 
@@ -583,5 +684,5 @@ function compare(word, pdf, ocrGroups) {
 }
 
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { compare, pdfGroups, verticalJoin, norm, cleanLabel, extractLabels, extractChartGroups };
+  module.exports = { compare, pdfGroups, verticalJoin, norm, cleanLabel, extractLabels, extractChartGroups, locateCluster };
 }

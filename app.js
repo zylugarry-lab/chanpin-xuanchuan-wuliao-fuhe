@@ -19,6 +19,7 @@ const nameInput = document.querySelector("#material-name");
 let findings = [];
 let matchedText = "";
 let filter = "全部";
+let imageUrls = [];
 
 wordInput.addEventListener("change", () => {
   wordName.textContent = wordInput.files[0] ? wordInput.files[0].name : "选择 .docx";
@@ -63,7 +64,14 @@ runBtn.addEventListener("click", async () => {
       }
     }
     const result = compare(word, pdf, ocrGroups);
+    imageUrls.forEach((url) => URL.revokeObjectURL(url));
+    imageUrls = word.images.map((bytes) => URL.createObjectURL(new Blob([bytes])));
     findings = result.findings;
+    findings.forEach((row) => {
+      if (row.imageId != null && imageUrls[row.imageId]) row.wordImage = imageUrls[row.imageId];
+    });
+    statusEl.textContent = "正在截取成品上对应的位置…";
+    await attachPdfShots(pdf.doc, pdf.items, findings);
     matchedText = result.matched;
     filter = "全部";
     render();
@@ -156,6 +164,7 @@ async function readPdf(file) {
         x: item.transform[4],
         y: viewport.height - item.transform[5],
         w: item.width || Math.max(8, item.str.length * 6),
+        h: item.height || 8,
         page: i,
       });
       line += item.str;
@@ -167,7 +176,7 @@ async function readPdf(file) {
     if (line) lines.push(line);
     pages.push(lines.join("\n"));
   }
-  return { text: pages.join("\n"), items };
+  return { text: pages.join("\n"), items, doc: pdf };
 }
 
 async function ocrImages(images, onStatus) {
@@ -189,12 +198,55 @@ async function ocrImages(images, onStatus) {
           if (!labels.includes(label)) labels.push(label);
         });
       });
-      if (labels.length >= 2) groups.push(labels.slice(0, 8));
+      if (labels.length >= 2) groups.push({ labels: labels.slice(0, 8), imageId: i });
     }
   } finally {
     await worker.terminate();
   }
   return groups;
+}
+
+async function attachPdfShots(pdfDoc, items, rows) {
+  const cache = new Map();
+  for (const row of rows) {
+    const showShot = row.note.indexOf("图例") === 0 || row.note.indexOf("正负号") === 0;
+    if (!row.focus || !showShot) continue;
+    const box = locateCluster(items, row.pdfHints, row.focus);
+    if (!box) continue;
+    const url = await cropPdf(pdfDoc, cache, box);
+    if (url) row.pdfImage = url;
+  }
+}
+
+async function cropPdf(pdfDoc, cache, box) {
+  let entry = cache.get(box.page);
+  if (!entry) {
+    const page = await pdfDoc.getPage(box.page);
+    const scale = 2.2;
+    const viewport = page.getViewport({ scale });
+    const canvas = document.createElement("canvas");
+    canvas.width = viewport.width;
+    canvas.height = viewport.height;
+    await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
+    entry = { canvas, scale };
+    cache.set(box.page, entry);
+  }
+  const scale = entry.scale;
+  const sx = Math.max(0, Math.floor(box.x * scale));
+  const sy = Math.max(0, Math.floor(box.y * scale));
+  const sw = Math.min(entry.canvas.width - sx, Math.ceil(box.w * scale));
+  const sh = Math.min(entry.canvas.height - sy, Math.ceil(box.h * scale));
+  if (sw < 8 || sh < 8) return "";
+  const out = document.createElement("canvas");
+  out.width = sw;
+  out.height = sh;
+  out.getContext("2d").drawImage(entry.canvas, sx, sy, sw, sh, 0, 0, sw, sh);
+  return out.toDataURL("image/jpeg", 0.86);
+}
+
+function shotHtml(url, caption) {
+  if (!url) return "";
+  return `<figure class="shot"><img src="${url}" alt="${escapeHtml(caption)}"><figcaption>${escapeHtml(caption)}</figcaption></figure>`;
 }
 
 function render() {
@@ -222,8 +274,8 @@ function render() {
     .map(
       (f) => `<tr class="${cls[f.kind] || ""}">
         <td>${escapeHtml(f.kind)}</td>
-        <td>${f.wordHtml}</td>
-        <td>${f.pdfHtml}</td>
+        <td>${f.wordHtml}${shotHtml(f.wordImage, "稿里的这张图")}</td>
+        <td>${f.pdfHtml}${shotHtml(f.pdfImage, "成品上的位置")}</td>
         <td>${escapeHtml(f.note)}</td>
         <td><select><option value="">待确认</option><option>按稿修改</option><option>按成品保留</option><option>不是问题</option></select></td>
       </tr>`,
@@ -234,3 +286,14 @@ function render() {
   }
   matchedEl.textContent = matchedText;
 }
+
+const lightbox = document.querySelector("#lightbox");
+document.addEventListener("click", (event) => {
+  const thumb = event.target.closest(".shot img");
+  if (thumb) {
+    lightbox.hidden = false;
+    lightbox.innerHTML = `<img src="${thumb.src}" alt="">`;
+    return;
+  }
+  if (!lightbox.hidden) lightbox.hidden = true;
+});
