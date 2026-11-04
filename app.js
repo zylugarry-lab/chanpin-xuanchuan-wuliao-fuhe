@@ -47,23 +47,38 @@ runBtn.addEventListener("click", async () => {
       readDocx(wordInput.files[0]),
       readPdf(pdfInput.files[0]),
     ]);
-    if (pdf.text.replace(/\s/g, "").length < 40) {
-      warnEl.hidden = false;
-      warnEl.textContent =
-        "这份 PDF 几乎没有可选中的文字，多半是扫描件或整页图片。网页只能对文字层，这种文件对出来会是空的或不可靠。";
-    }
+    const scan = pdf.text.replace(/\s/g, "").length < 40;
     let ocrGroups = [];
-    if (word.images.length) {
+    if (word.images.length || scan) {
       try {
-        const ocr = await ocrImages(word.images, (message) => {
-          statusEl.textContent = message;
-        });
-        ocrGroups = ocr.groups;
-        word.ocrText = ocr.text;
+        const worker = await createOcrWorker();
+        try {
+          if (word.images.length) {
+            const ocr = await ocrImages(worker, word.images, (message) => {
+              statusEl.textContent = message;
+            });
+            ocrGroups = ocr.groups;
+            word.ocrText = ocr.text;
+            word.ocrLines = ocr.lines;
+          }
+          if (scan) {
+            pdf.ocrText = await ocrPdfPages(worker, pdf.doc, (message) => {
+              statusEl.textContent = message;
+            });
+          }
+        } finally {
+          await worker.terminate();
+        }
       } catch (err) {
         warnEl.hidden = false;
-        warnEl.textContent = "稿里的图片这次没有识别成文字，图例可能对不到。表格和正文仍按文字层对照。";
+        warnEl.textContent = "图片这次没有识别成文字。表格和正文仍按文字层对照。";
       }
+    }
+    if (scan) {
+      warnEl.hidden = false;
+      warnEl.textContent = pdf.ocrText
+        ? "这份 PDF 是整页图片，已按版面识别。只列出和稿大体对得上、但标点或个别字不同的句子。"
+        : "这份 PDF 几乎没有可选中的文字，版面也没有识别出来。";
     }
     const result = compare(word, pdf, ocrGroups);
     imageUrls.forEach((url) => URL.revokeObjectURL(url));
@@ -122,7 +137,7 @@ async function readDocx(file) {
   const fileXml = zip.file("word/document.xml");
   if (!fileXml) throw new Error("这不是可读取的 docx");
   let xml = await fileXml.async("string");
-  xml = xml.replace(/<w:del\b[^>]*>[\s\S]*?<\/w:del>/g, "");
+  xml = acceptTrackChanges(xml);
   const lines = [];
   xml.split("</w:p>").forEach((chunk) => {
     const texts = [...chunk.matchAll(/<w:t[^>]*>([^<]*)<\/w:t>/g)].map((m) => decodeXml(m[1]));
@@ -188,39 +203,63 @@ async function readPdf(file) {
   return { text: pages.join("\n"), items, doc: pdf };
 }
 
-async function ocrImages(images, onStatus) {
+function createOcrWorker() {
   if (typeof Tesseract === "undefined") throw new Error("识别组件没有加载");
-  const worker = await Tesseract.createWorker("chi_sim", 1, {
+  return Tesseract.createWorker("chi_sim", 1, {
     workerPath: "https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/worker.min.js",
     corePath: "https://cdn.jsdelivr.net/npm/tesseract.js-core@5.1.1",
     langPath: "https://tessdata.projectnaptha.com/4.0.0_fast",
   });
+}
+
+async function ocrImages(worker, images, onStatus) {
   const groups = [];
   const texts = [];
-  try {
-    for (let i = 0; i < images.length; i++) {
-      onStatus(`正在识别稿里的图片（${i + 1}/${images.length}）…`);
-      const { data } = await worker.recognize(new Blob([images[i]]));
-      const labels = [];
-      (data.lines || []).forEach((line) => {
-        if (line.confidence < 45) return;
-        if (line.text) texts.push(line.text);
-        extractLabels(line.text || "").forEach((label) => {
-          if (!labels.includes(label)) labels.push(label);
-        });
+  const lines = [];
+  for (let i = 0; i < images.length; i++) {
+    onStatus(`正在识别稿里的图片（${i + 1}/${images.length}）…`);
+    const { data } = await worker.recognize(new Blob([images[i]]));
+    const labels = [];
+    (data.lines || []).forEach((line) => {
+      if (line.confidence < 45) return;
+      const text = (line.text || "").trim();
+      if (!text) return;
+      texts.push(text);
+      lines.push({ text, imageId: i });
+      extractLabels(text).forEach((label) => {
+        if (!labels.includes(label)) labels.push(label);
       });
-      if (labels.length >= 2) groups.push({ labels: labels.slice(0, 12), imageId: i });
-    }
-  } finally {
-    await worker.terminate();
+    });
+    if (labels.length >= 2) groups.push({ labels: labels.slice(0, 12), imageId: i });
   }
-  return { groups, text: texts.join("\n") };
+  return { groups, text: texts.join("\n"), lines };
+}
+
+async function ocrPdfPages(worker, pdfDoc, onStatus) {
+  const texts = [];
+  for (let i = 1; i <= pdfDoc.numPages; i++) {
+    onStatus(`正在识别成品版面（${i}/${pdfDoc.numPages}）…`);
+    const page = await pdfDoc.getPage(i);
+    const base = page.getViewport({ scale: 1 });
+    const viewport = page.getViewport({ scale: Math.min(1.4, 1600 / base.width) });
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.ceil(viewport.width);
+    canvas.height = Math.ceil(viewport.height);
+    await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
+    const { data } = await worker.recognize(canvas);
+    (data.lines || []).forEach((line) => {
+      if (line.confidence < 45) return;
+      const text = (line.text || "").replace(/\s+/g, "").trim();
+      if (text) texts.push(text);
+    });
+  }
+  return texts.join("\n");
 }
 
 async function attachPdfShots(pdfDoc, items, rows) {
   const cache = new Map();
   for (const row of rows) {
-    const showShot = /^(图例|正负号|短标题|标点|这几个字在稿的图片|这句前面|这里少了|句末|成品单独写出)/.test(row.note);
+    const showShot = /^(图例|正负号|短标题|标点|数字|这几个字在稿的图片|这句前面|这里少了|句末|成品单独写出)/.test(row.note);
     if (!row.focus || !showShot) continue;
     const box = locateCluster(items, row.pdfHints, row.focus);
     if (!box) continue;

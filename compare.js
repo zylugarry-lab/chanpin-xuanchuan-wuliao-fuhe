@@ -78,6 +78,17 @@ function decodeXml(s) {
     .replace(/&amp;/g, "&");
 }
 
+function acceptTrackChanges(xml) {
+  let text = String(xml || "");
+  text = text.replace(/<w:del\b[^>]*\/>/g, "");
+  let prev;
+  do {
+    prev = text;
+    text = text.replace(/<w:del\b[^>]*>[\s\S]*?<\/w:del>/g, "");
+  } while (text !== prev);
+  return text;
+}
+
 function worthReporting(a, b, leftover) {
   const x = norm(cleanLabel(a));
   const y = norm(cleanLabel(b));
@@ -639,10 +650,153 @@ function onlyInsideLongerWord(blob, label) {
   return inside && !alone;
 }
 
+function ocrFold(value) {
+  return norm(value).replace(/[〈]/g, "(").replace(/[〉]/g, ")");
+}
+
+function alignFold(value) {
+  return String(value || "")
+    .replace(/\s+/g, "")
+    .replace(/[（(〈]/g, "(")
+    .replace(/[）)〉]/g, ")");
+}
+
+function hanSlots(folded) {
+  const hanChars = [];
+  const gaps = [];
+  let buf = "";
+  for (const ch of folded) {
+    if (/[\u4e00-\u9fff]/.test(ch)) {
+      gaps.push(buf);
+      hanChars.push(ch);
+      buf = "";
+    } else buf += ch;
+  }
+  gaps.push(buf);
+  return { hans: hanChars.join(""), gaps, hanChars };
+}
+
+function gapMatter(gap) {
+  return gap.replace(/[()]/g, "");
+}
+
+function rebuild(slots, from, to) {
+  let text = "";
+  for (let i = from; i < to; i++) text += slots.gaps[i] + slots.hanChars[i];
+  text += slots.gaps[to] || "";
+  return text;
+}
+
+function pictureEdits(entries, pdfBlob, allowHan) {
+  const pdfSlots = hanSlots(alignFold(pdfBlob));
+  if (pdfSlots.hans.length < 8) return [];
+  const lines = [];
+  (entries || []).forEach((entry) => {
+    const text = String(entry.text || "").replace(/\s+/g, "").trim();
+    if (text.length >= 8) lines.push({ text, imageId: entry.imageId });
+  });
+  const chunks = [];
+  for (let i = 0; i < lines.length; i++) {
+    chunks.push(lines[i]);
+    const next = lines[i + 1];
+    if (next && next.imageId === lines[i].imageId && lines[i].text.length + next.text.length <= 90) {
+      chunks.push({ text: lines[i].text + next.text, imageId: lines[i].imageId });
+    }
+    lines[i].text.split(/(?<=[，。；])/).forEach((part) => {
+      if (part.length >= 8) chunks.push({ text: part, imageId: lines[i].imageId });
+    });
+    for (let start = 0; start < lines[i].text.length; start += 8) {
+      const part = lines[i].text.slice(start, start + 18);
+      if (part.length >= 8) chunks.push({ text: part, imageId: lines[i].imageId });
+    }
+  }
+  chunks.sort((a, b) => b.text.length - a.text.length);
+  const rows = [];
+  chunks.forEach((chunk) => {
+    const wordSlots = hanSlots(alignFold(chunk.text));
+    if (wordSlots.hans.length < 6 || wordSlots.hans.length > 80) return;
+    if (rows.some((row) => row.word.includes(chunk.text))) return;
+    const at = pdfSlots.hans.indexOf(wordSlots.hans);
+    let wordWindow = "";
+    let pdfWindow = "";
+    let hanDiff = false;
+    let otherDiff = false;
+    if (at >= 0) {
+      const diffs = [];
+      for (let i = 0; i <= wordSlots.hans.length; i++) {
+        const wg = gapMatter(wordSlots.gaps[i]);
+        const pg = gapMatter(pdfSlots.gaps[at + i] || "");
+        if (i === 0 || (i === wordSlots.hans.length && !wg)) continue;
+        if (wg === pg) continue;
+        if (i === wordSlots.hans.length && pg.startsWith(wg)) continue;
+        diffs.push(i);
+      }
+      if (!diffs.length) return;
+      otherDiff = true;
+      const center = Math.min(diffs[0], wordSlots.hans.length - 1);
+      const from = Math.max(0, center - 6);
+      const to = Math.min(wordSlots.hans.length, center + 7);
+      let pdfTo = at + to;
+      if (diffs.includes(wordSlots.hans.length)) pdfTo = Math.min(pdfSlots.hans.length, pdfTo + 2);
+      wordWindow = rebuild(wordSlots, from, to);
+      pdfWindow = rebuild(
+        { hanChars: pdfSlots.hanChars, gaps: pdfSlots.gaps },
+        at + from,
+        pdfTo,
+      );
+      if (pdfTo > at + to) hanDiff = true;
+    } else if (allowHan) {
+      let anchorAt = -1;
+      const anchor = wordSlots.hans.slice(0, Math.min(6, wordSlots.hans.length));
+      anchorAt = pdfSlots.hans.indexOf(anchor);
+      if (anchorAt < 0) {
+        const mid = wordSlots.hans.slice(4, 10);
+        anchorAt = mid.length >= 4 ? pdfSlots.hans.indexOf(mid) - 4 : -1;
+      }
+      if (anchorAt < 0) return;
+      const from = Math.max(0, anchorAt - 1);
+      const to = Math.min(pdfSlots.hans.length, anchorAt + wordSlots.hans.length + 3);
+      const pdfWin = {
+        hans: pdfSlots.hans.slice(from, to),
+        hanChars: pdfSlots.hanChars.slice(from, to),
+        gaps: pdfSlots.gaps.slice(from, to + 1),
+      };
+      const diff = lcsDiff(wordSlots.hans, pdfWin.hans);
+      if (!diff || !diff.meaningful) return;
+      const hanMarks = markedCount(wordSlots.hans, diff.aMarks) + markedCount(pdfWin.hans, diff.bMarks);
+      if (hanMarks < 1 || hanMarks > 2) return;
+      hanDiff = true;
+      wordWindow = rebuild(wordSlots, 0, wordSlots.hans.length);
+      pdfWindow = rebuild(pdfWin, 0, pdfWin.hanChars.length);
+    } else return;
+    if (!wordWindow || !pdfWindow || alignFold(wordWindow) === alignFold(pdfWindow)) return;
+    if (rows.some((row) => row.word.includes(wordWindow) || wordWindow.includes(row.word))) return;
+    const nums = (value) => (String(value).match(/\d+/g) || []).join(",");
+    const puncts = (value) => (ocrFold(value).match(/[,.;]/g) || []).join("");
+    const digit = nums(wordWindow) !== nums(pdfWindow);
+    const punct = puncts(wordWindow) !== puncts(pdfWindow);
+    let note = "标点不一致。";
+    if (hanDiff) note = "标点或个别字不一致。";
+    else if (digit && punct) note = "标点或数字不一致。";
+    else if (digit) note = "数字不一致。";
+    else if (!punct && !otherDiff) return;
+    rows.push({
+      word: wordWindow.slice(0, 90),
+      pdf: pdfWindow.slice(0, 90),
+      note,
+      imageId: chunk.imageId,
+      focus: pdfWindow.slice(0, 12),
+    });
+  });
+  return rows;
+}
+
 function compare(word, pdf, ocrGroups) {
   const wordText = word.text || "";
   const pdfText = pdf.text || "";
   const ocrText = word.ocrText || "";
+  const pdfOcr = pdf.ocrText || "";
+  const scan = norm(pdfText).length < 40 && norm(pdfOcr).length >= 40;
   const wn = norm(wordText);
   const pn = norm(pdfText);
   const wnWithOcr = norm(wordText + "\n" + ocrText);
@@ -736,6 +890,7 @@ function compare(word, pdf, ocrGroups) {
     );
   });
   (ocrGroups || []).forEach((group) => {
+    if (scan) return;
     const labels = groupLabels(group);
     labels.forEach((label) => {
       const n = norm(label);
@@ -896,6 +1051,7 @@ function compare(word, pdf, ocrGroups) {
       return;
     }
     if (cover < 0.45) {
+      if (scan) return;
       pushSentence("稿有成品无", raw, "（成品文字层里没有这句）", "稿里有，成品文字层里对不上。转曲标题可能其实印在版面上。");
     }
   });
@@ -914,6 +1070,32 @@ function compare(word, pdf, ocrGroups) {
     }
   });
 
+  const picturePdf = scan ? pdfOcr : pdfText;
+  const imageEntries = word.ocrLines && word.ocrLines.length
+    ? word.ocrLines
+    : ocrText.split("\n").map((text) => ({ text, imageId: null }));
+  if (norm(picturePdf).length >= 40) {
+    pictureEdits(imageEntries, picturePdf, scan).forEach((row) => {
+      push(row.imageId == null ? "正文不一致" : "图片不一致", row.word, row.pdf, row.note, null, null, {
+        imageId: row.imageId,
+        focus: row.focus,
+        pdfHints: [row.focus],
+      });
+    });
+    if (scan) {
+      pictureEdits(
+        (word.lines || []).map((text) => ({ text, imageId: null })),
+        pdfOcr,
+        false,
+      ).forEach((row) => {
+        push("正文不一致", row.word, row.pdf, row.note, null, null, {
+          focus: row.focus,
+          pdfHints: [row.focus],
+        });
+      });
+    }
+  }
+
   const numRe = /[+\-−－]?\d+(?:\.\d+)?%|\d{4}[./年]\d{1,2}(?:[./月]\d{1,2}日?)?|\d{6}/g;
   const wordNums = new Set(wordText.match(numRe) || []);
   const pdfNums = new Set(pdfText.match(numRe) || []);
@@ -928,5 +1110,16 @@ function compare(word, pdf, ocrGroups) {
 }
 
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { compare, pdfGroups, verticalJoin, norm, cleanLabel, extractLabels, extractChartGroups, locateCluster };
+  module.exports = {
+    compare,
+    pdfGroups,
+    verticalJoin,
+    norm,
+    cleanLabel,
+    extractLabels,
+    extractChartGroups,
+    locateCluster,
+    acceptTrackChanges,
+    pictureEdits,
+  };
 }
