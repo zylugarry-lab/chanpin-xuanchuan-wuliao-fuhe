@@ -716,23 +716,34 @@ function pictureEdits(entries, pdfBlob, allowHan) {
     const wordSlots = hanSlots(alignFold(chunk.text));
     if (wordSlots.hans.length < 6 || wordSlots.hans.length > 80) return;
     if (rows.some((row) => row.word.includes(chunk.text))) return;
-    const at = pdfSlots.hans.indexOf(wordSlots.hans);
+    let at = pdfSlots.hans.indexOf(wordSlots.hans);
     let wordWindow = "";
     let pdfWindow = "";
     let hanDiff = false;
     let otherDiff = false;
     if (at >= 0) {
-      const diffs = [];
-      for (let i = 0; i <= wordSlots.hans.length; i++) {
-        const wg = gapMatter(wordSlots.gaps[i]);
-        const pg = gapMatter(pdfSlots.gaps[at + i] || "");
-        if (i === 0 || (i === wordSlots.hans.length && !wg)) continue;
-        if (wg === pg) continue;
-        if (i === wordSlots.hans.length && pg.startsWith(wg)) continue;
-        diffs.push(i);
+      let best = null;
+      while (at >= 0) {
+        const diffs = [];
+        for (let i = 0; i <= wordSlots.hans.length; i++) {
+          const wg = gapMatter(wordSlots.gaps[i]);
+          const pg = gapMatter(pdfSlots.gaps[at + i] || "");
+          if (i === 0 || (i === wordSlots.hans.length && !wg)) continue;
+          if (wg === pg) continue;
+          if (i === wordSlots.hans.length && pg.startsWith(wg)) continue;
+          diffs.push(i);
+        }
+        if (!diffs.length) {
+          best = null;
+          break;
+        }
+        if (!best || diffs.length < best.diffs.length) best = { at, diffs };
+        at = pdfSlots.hans.indexOf(wordSlots.hans, at + 1);
       }
-      if (!diffs.length) return;
+      if (!best) return;
       otherDiff = true;
+      const diffs = best.diffs;
+      at = best.at;
       const center = Math.min(diffs[0], wordSlots.hans.length - 1);
       const from = Math.max(0, center - 6);
       const to = Math.min(wordSlots.hans.length, center + 7);
@@ -1070,6 +1081,79 @@ function compare(word, pdf, ocrGroups) {
     }
   });
 
+  if (scan && norm(pdfOcr).length >= 40) {
+    const on = norm(pdfOcr);
+    const reported = [];
+    let scanRows = 0;
+    const pieces = [];
+    sentences(wordText).forEach(({ raw, n }) => {
+      if (n.length <= 90) {
+        pieces.push({ raw, n });
+        return;
+      }
+      for (let i = 0; i < n.length; i += 40) {
+        const part = n.slice(i, i + 80);
+        if (part.length >= 12) pieces.push({ raw: part, n: part });
+      }
+    });
+    pieces.forEach(({ raw, n }) => {
+      if (scanRows >= 40) return;
+      if (on.includes(n)) return;
+      const cover = coverage(n, on);
+      if (cover < 0.55) return;
+      const width = Math.min(8, n.length);
+      let best = null;
+      for (let i = 0; i + width <= n.length; i += 4) {
+        const probe = n.slice(i, i + width);
+        let from = 0;
+        let j = -1;
+        while ((j = on.indexOf(probe, from)) >= 0) {
+          const start = Math.max(0, j - i);
+          const win = on.slice(start, start + n.length + 6);
+          const diff = lcsDiff(n, win);
+          if (diff && diff.changed && diff.meaningful) {
+            const markCount = diff.aMarks.filter(Boolean).length;
+            const same = (n.length - markCount) / n.length;
+            if (same >= 0.82 && (!best || markCount < best.markCount)) {
+              best = { diff, right: win, markCount };
+            }
+          }
+          from = j + width;
+          if (from >= on.length) break;
+        }
+      }
+      if (!best) return;
+      const diff = best.diff;
+      const right = best.right;
+      const hanDigit = /[\u4e00-\u9fff0-9]/;
+      let marks = 0;
+      let anchor = "";
+      for (let i = 0; i < n.length; i++) {
+        if (diff.aMarks[i] && hanDigit.test(n[i])) marks++;
+        if (!diff.aMarks[i] && /[\u4e00-\u9fff]/.test(n[i])) {
+          anchor += n[i];
+          if (anchor.length > 8) anchor = anchor.slice(-8);
+        } else if (anchor.length >= 4 && diff.aMarks[i]) {
+          break;
+        } else if (diff.aMarks[i]) anchor = "";
+      }
+      if (marks < 1 || marks > 8) return;
+      if (anchor.length < 4) anchor = n.slice(0, 8);
+      if (reported.some((item) => item.includes(anchor) || anchor.includes(item))) return;
+      reported.push(anchor);
+      scanRows++;
+      push(
+        "正文不一致",
+        raw.slice(0, 90),
+        right.slice(0, 90),
+        "同一句里有字不一样。",
+        paint(n, diff.aMarks),
+        paint(right.slice(0, diff.bMarks.length), diff.bMarks),
+        { focus: anchor, pdfHints: [anchor] },
+      );
+    });
+  }
+
   const picturePdf = scan ? pdfOcr : pdfText;
   const imageEntries = word.ocrLines && word.ocrLines.length
     ? word.ocrLines
@@ -1098,7 +1182,7 @@ function compare(word, pdf, ocrGroups) {
 
   const numRe = /[+\-−－]?\d+(?:\.\d+)?%|\d{4}[./年]\d{1,2}(?:[./月]\d{1,2}日?)?|\d{6}/g;
   const wordNums = new Set(wordText.match(numRe) || []);
-  const pdfNums = new Set(pdfText.match(numRe) || []);
+  const pdfNums = new Set((pdfText + (scan ? "\n" + pdfOcr : "")).match(numRe) || []);
   const both = [...wordNums].filter((n) => pdfNums.has(n));
   both.sort();
 

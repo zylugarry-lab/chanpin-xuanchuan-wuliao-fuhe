@@ -14,7 +14,7 @@
       <p class="eyebrow">Word 稿 × PDF 成品</p>
       <h1>产品宣传物料复核</h1>
     </div>
-      <p class="lede">文件只在这台浏览器里处理，不会上传。正文、表格、图例和带正负号的数字都会对。差错出在图片或图例上时，结果里直接显示那张图。整页图片的 PDF 会按版面再认一遍，只报和稿对得上、但标点或个别字不同的句子。</p>
+      <p class="lede">文件只在这台浏览器里处理，不会上传。成品可以是 PDF，也可以是 PNG 或 JPG。正文、表格、图例和带正负号的数字都会对。整页图片会分段识别后再和稿对照，差错旁边显示成品上的那一块。</p>
   </header>
 
   <main>
@@ -26,10 +26,10 @@
         <input id="word-file" type="file" accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document" hidden />
       </label>
       <label class="drop" id="pdf-drop">
-        <span class="drop-kicker">PDF 成品</span>
-        <strong id="pdf-name">选择 .pdf</strong>
-        <span class="drop-hint">没有文字层时会识别版面</span>
-        <input id="pdf-file" type="file" accept=".pdf,application/pdf" hidden />
+        <span class="drop-kicker">PDF 或图片</span>
+        <strong id="pdf-name">选择 PDF、PNG、JPG</strong>
+        <span class="drop-hint">长图会分段识别</span>
+        <input id="pdf-file" type="file" accept=".pdf,.png,.jpg,.jpeg,application/pdf,image/png,image/jpeg" hidden />
       </label>
     </section>
 

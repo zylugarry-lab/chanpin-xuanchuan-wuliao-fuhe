@@ -30,7 +30,7 @@ wordInput.addEventListener("change", () => {
   syncRun();
 });
 pdfInput.addEventListener("change", () => {
-  pdfName.textContent = pdfInput.files[0] ? pdfInput.files[0].name : "选择 .pdf";
+  pdfName.textContent = pdfInput.files[0] ? pdfInput.files[0].name : "选择 PDF、PNG、JPG";
   document.querySelector("#pdf-drop").classList.toggle("ready", !!pdfInput.files[0]);
   syncRun();
 });
@@ -43,9 +43,10 @@ runBtn.addEventListener("click", async () => {
   statusEl.textContent = "正在抽取文字…";
   warnEl.hidden = true;
   try {
+    const finished = pdfInput.files[0];
     const [word, pdf] = await Promise.all([
       readDocx(wordInput.files[0]),
-      readPdf(pdfInput.files[0]),
+      isImageFile(finished) ? readImageFile(finished) : readPdf(finished),
     ]);
     const scan = pdf.text.replace(/\s/g, "").length < 40;
     let ocrGroups = [];
@@ -61,10 +62,19 @@ runBtn.addEventListener("click", async () => {
             word.ocrText = ocr.text;
             word.ocrLines = ocr.lines;
           }
-          if (scan) {
-            pdf.ocrText = await ocrPdfPages(worker, pdf.doc, (message) => {
+          if (pdf.image) {
+            const ocr = await ocrImageElement(worker, pdf.image, (message) => {
               statusEl.textContent = message;
             });
+            pdf.ocrText = ocr.text;
+            pdf.ocrLines = ocr.lines;
+          } else if (scan) {
+            const ocr = await ocrPdfPages(worker, pdf.doc, (message) => {
+              statusEl.textContent = message;
+            });
+            pdf.ocrText = ocr.text;
+            pdf.ocrLines = ocr.lines;
+            pdf.pageCanvases = ocr.pages;
           }
         } finally {
           await worker.terminate();
@@ -74,11 +84,12 @@ runBtn.addEventListener("click", async () => {
         warnEl.textContent = "图片这次没有识别成文字。表格和正文仍按文字层对照。";
       }
     }
-    if (scan) {
+    if (pdf.image || scan) {
       warnEl.hidden = false;
+      const kind = pdf.image ? "图片" : "整页图片的 PDF";
       warnEl.textContent = pdf.ocrText
-        ? "这份 PDF 是整页图片，已按版面识别。只列出和稿大体对得上、但标点或个别字不同的句子。"
-        : "这份 PDF 几乎没有可选中的文字，版面也没有识别出来。";
+        ? `这份成品是${kind}，已按版面识别。列出和稿大体对得上、但有字不同的句子。`
+        : "版面没有识别出文字。";
     }
     const result = compare(word, pdf, ocrGroups);
     imageUrls.forEach((url) => URL.revokeObjectURL(url));
@@ -88,7 +99,9 @@ runBtn.addEventListener("click", async () => {
       if (row.imageId != null && imageUrls[row.imageId]) row.wordImage = imageUrls[row.imageId];
     });
     statusEl.textContent = "正在截取成品上对应的位置…";
-    await attachPdfShots(pdf.doc, pdf.items, findings);
+    if (pdf.image) await attachImageShots(pdf.image, pdf.ocrLines || [], findings);
+    else if (pdf.pageCanvases) await attachCanvasShots(pdf.pageCanvases, pdf.ocrLines || [], findings);
+    else await attachPdfShots(pdf.doc, pdf.items, findings);
     matchedText = result.matched;
     filter = "全部";
     render();
@@ -235,10 +248,82 @@ async function ocrImages(worker, images, onStatus) {
   return { groups, text: texts.join("\n"), lines };
 }
 
+function isImageFile(file) {
+  return /^image\/(png|jpeg)$/.test(file.type) || /\.(png|jpe?g)$/i.test(file.name);
+}
+
+async function readImageFile(file) {
+  const url = URL.createObjectURL(file);
+  const image = await new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error("这张图片没有打开"));
+    img.src = url;
+  });
+  return { text: "", items: [], image, imageUrl: url };
+}
+
+function takeOcrLines(data, mapBox) {
+  const texts = [];
+  const lines = [];
+  (data.lines || []).forEach((line) => {
+    if (line.confidence < 45) return;
+    const text = (line.text || "").replace(/\s+/g, "").trim();
+    if (!text) return;
+    const box = line.bbox || { x0: 0, y0: 0, x1: 0, y1: 0 };
+    texts.push(text);
+    lines.push({ text, ...mapBox(box) });
+  });
+  return { texts, lines };
+}
+
+async function ocrCanvasBands(worker, canvas, onStatus, label, mapLine) {
+  const bandH = 1400;
+  const overlap = 80;
+  const texts = [];
+  const lines = [];
+  const step = bandH - overlap;
+  const bands = Math.max(1, Math.ceil((canvas.height - overlap) / step));
+  for (let i = 0; i < bands; i++) {
+    const y = i * step;
+    if (y >= canvas.height) break;
+    const h = Math.min(bandH, canvas.height - y);
+    onStatus(`${label}（${i + 1}/${bands}）…`);
+    let target = canvas;
+    if (canvas.height > bandH) {
+      target = document.createElement("canvas");
+      target.width = canvas.width;
+      target.height = h;
+      target.getContext("2d").drawImage(canvas, 0, y, canvas.width, h, 0, 0, canvas.width, h);
+    }
+    const { data } = await worker.recognize(target);
+    const got = takeOcrLines(data, (box) => mapLine(box, y));
+    texts.push(...got.texts);
+    lines.push(...got.lines);
+  }
+  return { text: texts.join("\n"), lines };
+}
+
+async function ocrImageElement(worker, image, onStatus) {
+  const maxW = 1400;
+  const scale = Math.min(1, maxW / image.width);
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.ceil(image.width * scale));
+  canvas.height = Math.max(1, Math.ceil(image.height * scale));
+  canvas.getContext("2d").drawImage(image, 0, 0, canvas.width, canvas.height);
+  return ocrCanvasBands(worker, canvas, onStatus, "正在识别图片", (box, y) => ({
+    x: box.x0 / scale,
+    y: (y + box.y0) / scale,
+    w: Math.max(8, (box.x1 - box.x0) / scale),
+    h: Math.max(8, (box.y1 - box.y0) / scale),
+  }));
+}
+
 async function ocrPdfPages(worker, pdfDoc, onStatus) {
   const texts = [];
+  const lines = [];
+  const pages = [];
   for (let i = 1; i <= pdfDoc.numPages; i++) {
-    onStatus(`正在识别成品版面（${i}/${pdfDoc.numPages}）…`);
     const page = await pdfDoc.getPage(i);
     const base = page.getViewport({ scale: 1 });
     const viewport = page.getViewport({ scale: Math.min(1.4, 1600 / base.width) });
@@ -246,21 +331,70 @@ async function ocrPdfPages(worker, pdfDoc, onStatus) {
     canvas.width = Math.ceil(viewport.width);
     canvas.height = Math.ceil(viewport.height);
     await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
-    const { data } = await worker.recognize(canvas);
-    (data.lines || []).forEach((line) => {
-      if (line.confidence < 45) return;
-      const text = (line.text || "").replace(/\s+/g, "").trim();
-      if (text) texts.push(text);
-    });
+    pages.push(canvas);
+    const ocr = await ocrCanvasBands(worker, canvas, onStatus, `正在识别成品版面，第 ${i} 页`, (box, y) => ({
+      page: i - 1,
+      x: box.x0,
+      y: y + box.y0,
+      w: Math.max(8, box.x1 - box.x0),
+      h: Math.max(8, box.y1 - box.y0),
+    }));
+    texts.push(ocr.text);
+    lines.push(...ocr.lines);
   }
-  return texts.join("\n");
+  return { text: texts.join("\n"), lines, pages };
+}
+
+function showShot(note) {
+  return /^(图例|正负号|短标题|标点|数字|这几个字在稿的图片|这句前面|这里少了|句末|成品单独写出|同一句)/.test(note || "");
+}
+
+function locateOcrLine(lines, focus) {
+  const probe = String(focus || "").replace(/\s+/g, "").slice(0, 10);
+  if (probe.length < 4) return null;
+  return lines.find((line) => line.text.includes(probe)) || null;
+}
+
+function cropSource(source, box) {
+  const padX = 28;
+  const padY = 16;
+  const sx = Math.max(0, Math.floor(box.x - padX));
+  const sy = Math.max(0, Math.floor(box.y - padY));
+  const sw = Math.min(source.width - sx, Math.ceil(box.w + padX * 2));
+  const sh = Math.min(source.height - sy, Math.ceil(box.h + padY * 2));
+  if (sw < 8 || sh < 8) return "";
+  const out = document.createElement("canvas");
+  out.width = sw;
+  out.height = sh;
+  out.getContext("2d").drawImage(source, sx, sy, sw, sh, 0, 0, sw, sh);
+  return out.toDataURL("image/jpeg", 0.86);
+}
+
+async function attachImageShots(image, lines, rows) {
+  rows.forEach((row) => {
+    if (!showShot(row.note)) return;
+    const hit = locateOcrLine(lines, row.focus);
+    if (!hit) return;
+    const url = cropSource(image, hit);
+    if (url) row.pdfImage = url;
+  });
+}
+
+async function attachCanvasShots(canvases, lines, rows) {
+  rows.forEach((row) => {
+    if (!showShot(row.note)) return;
+    const hit = locateOcrLine(lines, row.focus);
+    const canvas = hit && canvases[hit.page];
+    if (!canvas) return;
+    const url = cropSource(canvas, hit);
+    if (url) row.pdfImage = url;
+  });
 }
 
 async function attachPdfShots(pdfDoc, items, rows) {
   const cache = new Map();
   for (const row of rows) {
-    const showShot = /^(图例|正负号|短标题|标点|数字|这几个字在稿的图片|这句前面|这里少了|句末|成品单独写出)/.test(row.note);
-    if (!row.focus || !showShot) continue;
+    if (!row.focus || !showShot(row.note)) continue;
     const box = locateCluster(items, row.pdfHints, row.focus);
     if (!box) continue;
     const url = await cropPdf(pdfDoc, cache, box);
