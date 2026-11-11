@@ -642,6 +642,27 @@ function edgeLabelOnly(n, marks, full) {
   return interior.length >= 8 && full.includes(interior) && full.includes(moved);
 }
 
+function dateKey(text) {
+  const m = norm(text).match(/(\d{4})[年./-](\d{1,2})[月./-](\d{1,2})/);
+  if (!m) return "";
+  return `${m[1]}-${m[2].padStart(2, "0")}-${m[3].padStart(2, "0")}`;
+}
+
+function blobHasDate(blob, key) {
+  if (!key) return false;
+  const [year, month, day] = key.split("-");
+  const forms = [
+    `${year}年${Number(month)}月${Number(day)}`,
+    `${year}/${month}/${day}`,
+    `${year}/${Number(month)}/${Number(day)}`,
+    `${year}.${month}.${day}`,
+    `${year}.${Number(month)}.${Number(day)}`,
+    `${year}-${month}-${day}`,
+  ];
+  const folded = norm(blob);
+  return forms.some((form) => folded.includes(norm(form)));
+}
+
 function parseTier(text) {
   const t = String(text || "").replace(/\s+/g, "").replace(/＜/g, "<").replace(/＞/g, ">");
   let match = t.match(/(\d+)[天日]≤?N[<≤](\d+)[天日]/);
@@ -1174,6 +1195,11 @@ function compare(word, pdf, ocrGroups) {
     }
     if (cover < 0.45) {
       if (scan) return;
+      const core = n.replace(/[-—–_=|·•]/g, "");
+      if (core.length >= 2 && pn.includes(core)) return;
+      const logo = raw.replace(/\s/g, "").replace(/公司LOGO|固收品牌LOGO|指享增强LOGO|品牌LOGO|广告|\|/g, "");
+      if (logo.length === 0) return;
+      if (blobHasDate(pdfText + "\n" + pdfOcr, dateKey(raw))) return;
       pushSentence("稿有成品无", raw, "（成品文字层里没有这句）", "稿里有，成品文字层里对不上。转曲标题可能其实印在版面上。");
     }
   });
@@ -1185,6 +1211,11 @@ function compare(word, pdf, ocrGroups) {
     const cover = coverage(n, wnWithOcr);
     if (cover >= 0.9) return;
     if (cover < 0.4) {
+      const already = findings.some((item) => {
+        const other = norm(item.pdf);
+        return other.length >= 6 && (other.includes(n) || n.includes(other));
+      });
+      if (already) return;
       const ocrLabels = (ocrText.match(/[\u4e00-\u9fff]{4,}/g) || []).map((label) => norm(label));
       const shared = ocrLabels.filter((label) => n.includes(label)).length;
       if (shared >= 2) return;
@@ -1360,6 +1391,7 @@ function compare(word, pdf, ocrGroups) {
   (word.lines || []).forEach((line) => {
     const folded = norm(line).replace(/＜/g, "<").replace(/＞/g, ">");
     if (folded.length < 4 || folded.length > 32 || !/\d/.test(folded)) return;
+    if (norm(pdfText + "\n" + pdfOcr).includes(folded)) return;
     if (parseTier(line)) return;
     let best = null;
     otherLines.forEach((raw) => {
@@ -1376,7 +1408,38 @@ function compare(word, pdf, ocrGroups) {
       if (!best || marks < best.marks) best = { raw: String(raw).trim(), marks };
     });
     if (!best || norm(line) === norm(best.raw)) return;
+    if (norm(wordText).includes(norm(best.raw))) return;
     push("正文不一致", String(line).trim(), best.raw, "这几个字几乎一样，少了或多了个别字。");
+  });
+
+  const otherBlob = norm(pdfText + "\n" + pdfOcr);
+  const wordBlob = norm(wordText + "\n" + ocrText);
+  const otherShort = [];
+  otherLines.forEach((raw) => {
+    const text = String(raw || "").trim();
+    const n = norm(text);
+    if (n.length < 2 || n.length > 12 || wordBlob.includes(n)) return;
+    otherShort.push(text);
+  });
+  (word.lines || []).forEach((line) => {
+    const left = String(line || "").trim();
+    const a = norm(left);
+    if (a.length < 2 || a.length > 12 || otherBlob.includes(a) || dateKey(a)) return;
+    let best = null;
+    otherShort.forEach((raw) => {
+      const b = norm(raw);
+      let prefix = 0;
+      while (prefix < a.length && prefix < b.length && a[prefix] === b[prefix]) prefix++;
+      if (prefix < 2) return;
+      if (Math.abs(a.length - b.length) > 3) return;
+      const diff = lcsDiff(a, b);
+      if (!diff || !diff.meaningful) return;
+      const marks = markedCount(a, diff.aMarks) + markedCount(b, diff.bMarks);
+      if (marks < 1 || marks > 4) return;
+      if (!best || prefix > best.prefix) best = { raw, prefix };
+    });
+    if (!best) return;
+    push("正文不一致", left, best.raw, "这几个字对不上。请核对是不是指数、产品或名称写错。");
   });
 
   const numRe = /[+\-−－]?\d+(?:\.\d+)?%|\d{4}[./年]\d{1,2}(?:[./月]\d{1,2}日?)?|\d{6}/g;
@@ -1385,8 +1448,19 @@ function compare(word, pdf, ocrGroups) {
   const both = [...wordNums].filter((n) => pdfNums.has(n));
   both.sort();
 
+  const merged = findings.concat(sentenceFindings).filter((item, index, all) => {
+    if (item.kind !== "成品多写") return true;
+    const extra = norm(item.pdf);
+    if (extra.length < 6) return true;
+    return !all.some((other, otherIndex) => {
+      if (otherIndex === index || other.kind === "成品多写") return false;
+      const shown = norm(other.pdf);
+      return shown.length >= 6 && (shown.includes(extra) || extra.includes(shown));
+    });
+  });
+
   return {
-    findings: findings.concat(sentenceFindings).slice(0, 100),
+    findings: merged.slice(0, 100),
     matched: both.length ? both.slice(0, 40).join("、") : "没有抽出两边都出现的百分比、日期或六位代码。",
     pdfGroupCount: pdfSide.length,
   };
