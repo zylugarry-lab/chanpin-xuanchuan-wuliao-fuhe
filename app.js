@@ -88,7 +88,7 @@ runBtn.addEventListener("click", async () => {
       warnEl.hidden = false;
       const kind = pdf.image ? "图片" : "整页图片的 PDF";
       warnEl.textContent = pdf.ocrText
-        ? `这份成品是${kind}，已按版面识别。列出和稿大体对得上、但有字不同的句子。`
+        ? `这份成品是${kind}，已按版面识别。列出少字、多出来的短句，以及同一行费率对不上的地方。识别看错的字请对着原页确认。`
         : "版面没有识别出文字。";
     }
     const result = compare(word, pdf, ocrGroups);
@@ -164,9 +164,19 @@ async function readDocx(file) {
       .filter(Boolean);
     labels.forEach((label) => lines.push(label));
   }
+  const relsFile = zip.file("word/_rels/document.xml.rels");
+  const rels = relsFile ? await relsFile.async("string") : "";
+  const keptIds = new Set([...xml.matchAll(/r:id="(rId\d+)"/g)].map((match) => match[1]));
+  const keptCharts = new Set();
+  [...rels.matchAll(/Id="(rId\d+)"[^>]*Target="([^"]+)"/g)].forEach((match) => {
+    if (!keptIds.has(match[1])) return;
+    const target = match[2].replace(/^\//, "");
+    if (/charts\/chart\d+\.xml$/.test(target)) keptCharts.add("word/" + target.replace(/^word\//, ""));
+  });
   const chartGroups = [];
   const seenCharts = new Set();
   for (const chart of zip.file(/^word\/charts\/chart\d+\.xml$/) || []) {
+    if (keptCharts.size && !keptCharts.has(chart.name)) continue;
     const chartXml = await chart.async("string");
     extractChartGroups(chartXml).forEach((group) => {
       const key = group.join("\n");
@@ -176,11 +186,41 @@ async function readDocx(file) {
     });
   }
   const images = [];
+  let hasPortrait = false;
   for (const media of zip.file(/^word\/media\/.+\.(png|jpe?g)$/i) || []) {
     const bytes = await media.async("uint8array");
+    const size = imageSize(bytes);
+    if (size && size.h >= 320 && size.h > size.w * 1.05 && bytes.byteLength > 30000) hasPortrait = true;
     if (bytes.byteLength >= 20000) images.push(bytes);
   }
-  return { text: lines.join("\n"), lines, chartGroups, images };
+  return { text: lines.join("\n"), lines, chartGroups, images, hasPortrait };
+}
+
+function imageSize(bytes) {
+  const u = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  if (u.length > 24 && u[0] === 0x89 && u[1] === 0x50) {
+    return {
+      w: u[16] * 16777216 + u[17] * 65536 + u[18] * 256 + u[19],
+      h: u[20] * 16777216 + u[21] * 65536 + u[22] * 256 + u[23],
+    };
+  }
+  if (u[0] === 0xff && u[1] === 0xd8) {
+    let i = 2;
+    while (i + 9 < u.length) {
+      if (u[i] !== 0xff) {
+        i += 1;
+        continue;
+      }
+      const marker = u[i + 1];
+      const len = u[i + 2] * 256 + u[i + 3];
+      if (marker >= 0xc0 && marker <= 0xc3) {
+        return { h: u[i + 5] * 256 + u[i + 6], w: u[i + 7] * 256 + u[i + 8] };
+      }
+      if (len < 2) break;
+      i += 2 + len;
+    }
+  }
+  return null;
 }
 
 async function readPdf(file) {

@@ -183,7 +183,7 @@ function lcsDiff(a, b) {
   while (i < m) aMarks[i++] = true;
   while (j < n) bMarks[j++] = true;
   const changed = aMarks.some(Boolean) || bMarks.some(Boolean);
-  const meaningfulChar = /[\u4e00-\u9fff0-9%.,;:，。；：、]/;
+  const meaningfulChar = /[\u4e00-\u9fff0-9%.,;:，。；：、✖×xX]/;
   const meaningful =
     [...a].some((ch, idx) => aMarks[idx] && meaningfulChar.test(ch)) ||
     [...b].some((ch, idx) => bMarks[idx] && meaningfulChar.test(ch));
@@ -589,11 +589,114 @@ function strictText(value) {
 
 function markedCount(text, marks) {
   let count = 0;
-  const meaningfulChar = /[\u4e00-\u9fff0-9%.,;:，。；：、]/;
+  const meaningfulChar = /[\u4e00-\u9fff0-9%.,;:，。；：、✖×xX]/;
   for (let i = 0; i < text.length; i++) {
     if (marks[i] && meaningfulChar.test(text[i])) count++;
   }
   return count;
+}
+
+function punctBare(value) {
+  return norm(value).replace(/[,.:;]/g, "");
+}
+
+function bestWindow(n, full) {
+  const width = Math.min(8, n.length);
+  let best = null;
+  for (let i = 0; i + width <= n.length; i += 4) {
+    const probe = n.slice(i, i + width);
+    let from = 0;
+    let j = -1;
+    while ((j = full.indexOf(probe, from)) >= 0) {
+      const start = Math.max(0, j - i);
+      const win = full.slice(start, start + n.length + 6);
+      const diff = lcsDiff(n, win);
+      if (diff && !diff.changed) return { diff, right: win, markCount: 0, same: 1 };
+      if (diff && diff.meaningful) {
+        const markCount = markedCount(n, diff.aMarks);
+        const same = n.length ? (n.length - markCount) / n.length : 0;
+        if (!best || markCount < best.markCount) best = { diff, right: win, markCount, same };
+      }
+      from = j + width;
+      if (from >= full.length) break;
+    }
+  }
+  return best;
+}
+
+function edgeLabelOnly(n, marks, full) {
+  let first = -1;
+  let last = -1;
+  for (let i = 0; i < n.length; i++) {
+    if (marks[i] && /[\u4e00-\u9fff]/.test(n[i])) {
+      if (first < 0) first = i;
+      last = i;
+    }
+  }
+  if (first < 0) return false;
+  const atStart = first <= 8 && last < 10;
+  const atEnd = first >= n.length - 10;
+  if (!atStart && !atEnd) return false;
+  const interior = atStart ? n.slice(last + 1) : n.slice(0, first);
+  const moved = atStart ? n.slice(0, last + 1) : n.slice(first);
+  return interior.length >= 8 && full.includes(interior) && full.includes(moved);
+}
+
+function parseTier(text) {
+  const t = String(text || "").replace(/\s+/g, "").replace(/＜/g, "<").replace(/＞/g, ">");
+  let match = t.match(/(\d+)[天日]≤?N[<≤](\d+)[天日]/);
+  if (match) return { lo: Number(match[1]), hi: Number(match[2]), unit: t.includes("天") ? "天" : "日", raw: t };
+  match = t.match(/N[<≤](\d+)[天日]/);
+  if (match) return { lo: 0, hi: Number(match[1]), unit: t.includes("天") ? "天" : "日", raw: t };
+  match = t.match(/N[>≥](\d+)[天日]/);
+  if (match) return { lo: Number(match[1]), hi: 99999, unit: t.includes("天") ? "天" : "日", raw: t };
+  return null;
+}
+
+function tierKey(tier) {
+  return tier.lo + "-" + tier.hi;
+}
+
+function percentList(text) {
+  return String(text || "").match(/\d+(?:\.\d+)?%/g) || [];
+}
+
+function holdingTiers(wordLines, positioned) {
+  const wordTiers = [];
+  const lines = wordLines || [];
+  for (let i = 0; i < lines.length; i++) {
+    const tier = parseTier(lines[i]);
+    if (!tier) continue;
+    const rates = percentList(lines[i]);
+    for (let j = i + 1; j < lines.length; j++) {
+      const next = String(lines[j] || "").trim();
+      if (!next || parseTier(next)) break;
+      if (!/^\d+(?:\.\d+)?%$/.test(next.replace(/\s+/g, ""))) break;
+      rates.push(next.replace(/\s+/g, ""));
+    }
+    wordTiers.push({ tier, rates });
+  }
+  const pdfTiers = [];
+  (positioned || []).forEach((item, index) => {
+    const text = item.str || item.text || "";
+    const tier = parseTier(text);
+    if (!tier) return;
+    const rates = percentList(text);
+    const y = Number(item.y);
+    const x = Number(item.x);
+    if (Number.isFinite(y) && Number.isFinite(x)) {
+      positioned.forEach((other) => {
+        const otherText = String(other.str || other.text || "").replace(/\s+/g, "");
+        if (!/^\d+(?:\.\d+)?%$/.test(otherText)) return;
+        if (!Number.isFinite(Number(other.y)) || !Number.isFinite(Number(other.x))) return;
+        if (Math.abs(Number(other.y) - y) > Math.max(14, Number(item.h) || 12)) return;
+        if (Number(other.x) <= x) return;
+        rates.push(otherText);
+      });
+    }
+    pdfTiers.push({ tier, rates, index });
+  });
+  return { wordTiers, pdfTiers };
 }
 
 function shortLabelsFromLines(lines) {
@@ -1043,21 +1146,29 @@ function compare(word, pdf, ocrGroups) {
     });
   }
 
+  const pairedPdf = new Set();
+  const pdfSentenceList = scan ? [] : sentences(pdfText);
   sentences(wordText).forEach(({ raw, n }) => {
     if (pn.includes(n)) return;
+    const bare = punctBare(n);
+    const pair = pdfSentenceList.find((item) => punctBare(item.n) === bare && item.n !== n);
+    if (pair && bare.length >= 8) {
+      pairedPdf.add(pair.n);
+      pushSentence("正文不一致", raw, pair.raw, "标点不一致。字对得上，冒号、逗号或分号对不上。");
+      return;
+    }
     const cover = coverage(n, pn);
-    const win = locate(n, pn);
-    const diff = win ? lcsDiff(n, win.slice(0, n.length + 4)) : null;
-    const smallEdit = diff && diff.changed && diff.meaningful && markedCount(n, diff.aMarks) > 0 && markedCount(n, diff.aMarks) <= 6;
-    if (cover >= 0.93 && !smallEdit) return;
-    if (diff && diff.changed && diff.meaningful && (cover >= 0.55 || smallEdit)) {
+    const best = bestWindow(n, pn);
+    if (best && best.markCount === 0) return;
+    if (best && best.same >= 0.82 && best.markCount >= 1 && best.markCount <= 12) {
+      if (edgeLabelOnly(n, best.diff.aMarks, pn)) return;
       pushSentence(
         "正文不一致",
         raw,
-        win,
+        best.right,
         "同一句里有字不一样，标出的是不同的地方。",
-        paint(n, diff.aMarks),
-        paint(win.slice(0, diff.bMarks.length), diff.bMarks),
+        paint(n, best.diff.aMarks),
+        paint(best.right.slice(0, best.diff.bMarks.length), best.diff.bMarks),
       );
       return;
     }
@@ -1067,8 +1178,8 @@ function compare(word, pdf, ocrGroups) {
     }
   });
 
-  sentences(pdfText).forEach(({ raw, n }) => {
-    if (wnWithOcr.includes(n)) return;
+  pdfSentenceList.forEach(({ raw, n }) => {
+    if (pairedPdf.has(n) || wnWithOcr.includes(n) || wnWithOcr.includes(punctBare(n))) return;
     const han = (n.match(/[\u4e00-\u9fff]/g) || []).length;
     if (han < 4) return;
     const cover = coverage(n, wnWithOcr);
@@ -1100,7 +1211,7 @@ function compare(word, pdf, ocrGroups) {
       if (scanRows >= 40) return;
       if (on.includes(n)) return;
       const cover = coverage(n, on);
-      if (cover < 0.55) return;
+      if (cover < 0.2) return;
       const width = Math.min(8, n.length);
       let best = null;
       for (let i = 0; i + width <= n.length; i += 4) {
@@ -1115,7 +1226,7 @@ function compare(word, pdf, ocrGroups) {
             const markCount = diff.aMarks.filter(Boolean).length;
             const same = (n.length - markCount) / n.length;
             if (same >= 0.82 && (!best || markCount < best.markCount)) {
-              best = { diff, right: win, markCount };
+              best = { diff, right: win, markCount, same };
             }
           }
           from = j + width;
@@ -1123,6 +1234,7 @@ function compare(word, pdf, ocrGroups) {
         }
       }
       if (!best) return;
+      if (cover < 0.55 && (best.same < 0.88 || best.markCount > 4)) return;
       const diff = best.diff;
       const right = best.right;
       const hanDigit = /[\u4e00-\u9fff0-9]/;
@@ -1138,6 +1250,7 @@ function compare(word, pdf, ocrGroups) {
         } else if (diff.aMarks[i]) anchor = "";
       }
       if (marks < 1 || marks > 8) return;
+      if (edgeLabelOnly(n, diff.aMarks, on)) return;
       if (anchor.length < 4) anchor = n.slice(0, 8);
       if (reported.some((item) => item.includes(anchor) || anchor.includes(item))) return;
       reported.push(anchor);
@@ -1179,6 +1292,92 @@ function compare(word, pdf, ocrGroups) {
       });
     }
   }
+
+  if (/配照片|附照片/.test(wordText) && word.hasPortrait === false) {
+    push(
+      "成品多写",
+      "稿写了「配照片」或「附照片」，稿里没有人像。",
+      "请看成品上是否多了人物照片。",
+      "稿里的「配照片」是制作说明。成品通常直接放照片，标题里不再写这几个字。",
+    );
+  }
+
+  if (scan && Array.isArray(pdf.ocrLines)) {
+    let extraLines = 0;
+    const blob = norm(wordText + "\n" + ocrText);
+    pdf.ocrLines.forEach((line) => {
+      if (extraLines >= 8) return;
+      const text = String(line.text || "").replace(/\s+/g, "");
+      const hans = text.match(/[\u4e00-\u9fff]/g) || [];
+      const rest = text.replace(/[\u4e00-\u9fff，。、]/g, "");
+      if (hans.length < 6 || hans.length > 12 || rest.length > 1) return;
+      const n = norm(text);
+      if (!n || blob.includes(n)) return;
+      extraLines++;
+      push("成品多写", "（稿里没有这句）", text, "成品版面上有这句短句，稿里没有。请对着原页确认。", null, null, {
+        focus: text,
+        pdfHints: [text],
+      });
+    });
+  }
+
+  const positioned = (pdf.items && pdf.items.length ? pdf.items : pdf.ocrLines) || [];
+  const tiers = holdingTiers(word.lines || [], positioned);
+  const wordByKey = new Map();
+  tiers.wordTiers.forEach((item) => wordByKey.set(tierKey(item.tier), item));
+  const pdfByKey = new Map();
+  tiers.pdfTiers.forEach((item) => {
+    if (!pdfByKey.has(tierKey(item.tier))) pdfByKey.set(tierKey(item.tier), item);
+  });
+  let unitNoted = false;
+  wordByKey.forEach((item, key) => {
+    const other = pdfByKey.get(key);
+    if (!other) return;
+    if (!unitNoted && item.tier.unit !== other.tier.unit) {
+      unitNoted = true;
+      push(
+        "正文不一致",
+        item.tier.raw,
+        other.tier.raw,
+        "持有期限的单位不一致。同一组天数，一边写「天」，一边写「日」。",
+      );
+    }
+    const leftRates = item.rates.join("、");
+    const rightRates = other.rates.join("、");
+    if (leftRates && rightRates && leftRates !== rightRates) {
+      push(
+        "正文不一致",
+        item.tier.raw + " " + leftRates,
+        other.tier.raw + " " + rightRates,
+        "同一持有期限旁边的费率不一致。请核对是不是换了一档。",
+      );
+    }
+  });
+
+  const otherLines = scan
+    ? (pdf.ocrLines || []).map((line) => line.text)
+    : String(pdfText || "").split("\n");
+  (word.lines || []).forEach((line) => {
+    const folded = norm(line).replace(/＜/g, "<").replace(/＞/g, ">");
+    if (folded.length < 4 || folded.length > 32 || !/\d/.test(folded)) return;
+    if (parseTier(line)) return;
+    let best = null;
+    otherLines.forEach((raw) => {
+      const other = norm(raw).replace(/＜/g, "<").replace(/＞/g, ">");
+      if (!other || Math.abs(other.length - folded.length) > 3) return;
+      let prefix = 0;
+      const limit = Math.min(folded.length, other.length);
+      while (prefix < limit && folded[prefix] === other[prefix]) prefix++;
+      if (prefix < 4 || prefix < limit - 2) return;
+      const diff = lcsDiff(folded, other);
+      if (!diff || !diff.meaningful) return;
+      const marks = markedCount(folded, diff.aMarks) + markedCount(other, diff.bMarks);
+      if (marks < 1 || marks > 3) return;
+      if (!best || marks < best.marks) best = { raw: String(raw).trim(), marks };
+    });
+    if (!best || norm(line) === norm(best.raw)) return;
+    push("正文不一致", String(line).trim(), best.raw, "这几个字几乎一样，少了或多了个别字。");
+  });
 
   const numRe = /[+\-−－]?\d+(?:\.\d+)?%|\d{4}[./年]\d{1,2}(?:[./月]\d{1,2}日?)?|\d{6}/g;
   const wordNums = new Set(wordText.match(numRe) || []);
