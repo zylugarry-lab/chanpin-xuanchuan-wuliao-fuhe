@@ -584,7 +584,8 @@ function strictText(value) {
   return String(value || "")
     .replace(/\s+/g, "")
     .replace(/[（(]/g, "(")
-    .replace(/[）)]/g, ")");
+    .replace(/[）)]/g, ")")
+    .replace(/[：]/g, ":");
 }
 
 function markedCount(text, marks) {
@@ -598,6 +599,53 @@ function markedCount(text, marks) {
 
 function punctBare(value) {
   return norm(value).replace(/[,.:;]/g, "");
+}
+
+function punctuationAfterOwnHeading(sentence, marks, pdfText) {
+  const content = /[\u4e00-\u9fff0-9%✖×xX]/;
+  let first = -1;
+  for (let i = 0; i < sentence.length; i++) {
+    if (!marks[i]) continue;
+    if (content.test(sentence[i])) return false;
+    if (first < 0) first = i;
+  }
+  if (first < 0 || first > 12) return false;
+  const prefix = sentence.slice(0, first);
+  if (prefix.length < 2) return false;
+  return String(pdfText).split(/\n/).some((line) => {
+    const folded = norm(line);
+    return folded === prefix || folded === prefix.replace(/[.:;]$/, "");
+  });
+}
+
+function headingSplitOnly(sentence, pdfText, pdfNorm) {
+  const cut = sentence.search(/[,.:;]/);
+  if (cut < 2 || cut > 12) return false;
+  const prefix = sentence.slice(0, cut);
+  const rest = punctBare(sentence.slice(cut + 1));
+  if (rest.length < 8 || !pdfNorm.includes(rest.slice(0, Math.min(12, rest.length)))) return false;
+  return String(pdfText).split(/\n/).some((line) => norm(line) === prefix);
+}
+
+function yearMonthOnly(text) {
+  const folded = norm(text);
+  const match = folded.match(/(\d{4})(?:年|\.)(\d{1,2})月?/);
+  if (!match) return "";
+  const after = folded.slice(match.index + match[0].length);
+  if (/^\d/.test(after)) return "";
+  return `${match[1]}-${match[2].padStart(2, "0")}`;
+}
+
+function sameYearMonthAlreadyInWord(pdfSentence, wordText) {
+  const key = yearMonthOnly(pdfSentence);
+  if (!key) return false;
+  const [year, month] = key.split("-");
+  const forms = [`${year}.${Number(month)}`, `${year}.${month}`, `${year}年${Number(month)}月`];
+  const foldedWord = norm(wordText);
+  if (!forms.some((form) => foldedWord.includes(norm(form)))) return false;
+  const rest = norm(pdfSentence).replace(/(\d{4})(?:年|\.)(\d{1,2})月?/g, "").replace(/[^一-鿿]/g, "");
+  const wordHan = foldedWord.replace(/[^一-鿿]/g, "");
+  return rest.length >= 4 && wordHan.includes(rest);
 }
 
 function bestWindow(n, full) {
@@ -1169,8 +1217,15 @@ function compare(word, pdf, ocrGroups) {
 
   const pairedPdf = new Set();
   const pdfSentenceList = scan ? [] : sentences(pdfText);
-  sentences(wordText).forEach(({ raw, n }) => {
+  sentences(wordText).forEach((item) => {
+    let raw = item.raw;
+    let n = item.n;
+    if (/^[nu][\u4e00-\u9fff]/.test(n) && pn.includes(n.slice(1, 5))) {
+      raw = String(raw).replace(/^\s*[nu]/, "");
+      n = n.slice(1);
+    }
     if (pn.includes(n)) return;
+    if (headingSplitOnly(n, pdfText, pn)) return;
     const bare = punctBare(n);
     const pair = pdfSentenceList.find((item) => punctBare(item.n) === bare && item.n !== n);
     if (pair && bare.length >= 8) {
@@ -1183,6 +1238,7 @@ function compare(word, pdf, ocrGroups) {
     if (best && best.markCount === 0) return;
     if (best && best.same >= 0.82 && best.markCount >= 1 && best.markCount <= 12) {
       if (edgeLabelOnly(n, best.diff.aMarks, pn)) return;
+      if (punctuationAfterOwnHeading(n, best.diff.aMarks, pdfText)) return;
       pushSentence(
         "正文不一致",
         raw,
@@ -1200,6 +1256,10 @@ function compare(word, pdf, ocrGroups) {
       const logo = raw.replace(/\s/g, "").replace(/公司LOGO|固收品牌LOGO|指享增强LOGO|品牌LOGO|广告|\|/g, "");
       if (logo.length === 0) return;
       if (blobHasDate(pdfText + "\n" + pdfOcr, dateKey(raw))) return;
+      if (/[附配]照片/.test(raw)) {
+        const core = n.replace(/[（(]?[附配]照片[)）]?/g, "");
+        if (core.length < 4 || pn.includes(core)) return;
+      }
       pushSentence("稿有成品无", raw, "（成品文字层里没有这句）", "稿里有，成品文字层里对不上。转曲标题可能其实印在版面上。");
     }
   });
@@ -1216,6 +1276,7 @@ function compare(word, pdf, ocrGroups) {
         return other.length >= 6 && (other.includes(n) || n.includes(other));
       });
       if (already) return;
+      if (sameYearMonthAlreadyInWord(n, wordText)) return;
       const ocrLabels = (ocrText.match(/[\u4e00-\u9fff]{4,}/g) || []).map((label) => norm(label));
       const shared = ocrLabels.filter((label) => n.includes(label)).length;
       if (shared >= 2) return;
@@ -1440,6 +1501,16 @@ function compare(word, pdf, ocrGroups) {
     });
     if (!best) return;
     push("正文不一致", left, best.raw, "这几个字对不上。请核对是不是指数、产品或名称写错。");
+  });
+
+  (word.lines || []).forEach((line) => {
+    const left = String(line || "").trim();
+    const wrapped = left.match(/^[（(](.{4,})[）)]$/);
+    if (!wrapped) return;
+    const inner = wrapped[1].trim();
+    const hit = otherLines.find((raw) => norm(raw) === norm(inner));
+    if (!hit) return;
+    push("正文不一致", left, String(hit).trim(), "字是一样的。稿在这句外面多了一对括号。");
   });
 
   const numRe = /[+\-−－]?\d+(?:\.\d+)?%|\d{4}[./年]\d{1,2}(?:[./月]\d{1,2}日?)?|\d{6}/g;
