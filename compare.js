@@ -113,6 +113,30 @@ function extractChartGroups(xml) {
   return groups;
 }
 
+const UNREADABLE = /[◆◇♦▪●□■◻◼�\uFFFD]/g;
+
+function stripUnreadable(text) {
+  return String(text || "").replace(UNREADABLE, "");
+}
+
+function unreadableCount(text) {
+  return (norm(text).match(UNREADABLE) || []).length;
+}
+
+function noisyExtra(raw, wordBlob) {
+  const marks = unreadableCount(raw);
+  const separated = norm(String(raw || "").replace(UNREADABLE, ","));
+  const runs = separated.match(/[\u4e00-\u9fff]{4,}/g) || [];
+  if (marks) {
+    const missing = runs.filter((run) => !wordBlob.includes(run));
+    if (!missing.length) return true;
+    if (marks / Math.max(norm(raw).length, 1) >= 0.18 && missing.every((run) => run.length < 8)) return true;
+  }
+  const stripped = norm(stripUnreadable(raw));
+  if (stripped.length >= 8 && coverage(stripped, wordBlob) >= 0.62) return true;
+  return false;
+}
+
 function sentences(text) {
   const seen = new Set();
   const out = [];
@@ -1280,6 +1304,7 @@ function compare(word, pdf, ocrGroups) {
       const ocrLabels = (ocrText.match(/[\u4e00-\u9fff]{4,}/g) || []).map((label) => norm(label));
       const shared = ocrLabels.filter((label) => n.includes(label)).length;
       if (shared >= 2) return;
+      if (noisyExtra(raw, wnWithOcr)) return;
       pushSentence("成品多写", "（稿里没有这句）", raw, "成品文字层里有，稿里没有。图注和脚注经常落在这里。");
     }
   });
@@ -1399,12 +1424,13 @@ function compare(word, pdf, ocrGroups) {
     const blob = norm(wordText + "\n" + ocrText);
     pdf.ocrLines.forEach((line) => {
       if (extraLines >= 8) return;
-      const text = String(line.text || "").replace(/\s+/g, "");
+      const text = stripUnreadable(String(line.text || "")).replace(/\s+/g, "");
       const hans = text.match(/[\u4e00-\u9fff]/g) || [];
       const rest = text.replace(/[\u4e00-\u9fff，。、]/g, "");
       if (hans.length < 6 || hans.length > 12 || rest.length > 1) return;
+      if (unreadableCount(line.text) >= 2) return;
       const n = norm(text);
-      if (!n || blob.includes(n)) return;
+      if (!n || blob.includes(n) || noisyExtra(text, blob)) return;
       extraLines++;
       push("成品多写", "（稿里没有这句）", text, "成品版面上有这句短句，稿里没有。请对着原页确认。", null, null, {
         focus: text,

@@ -372,8 +372,9 @@ async function readDocx(file) {
   for (const media of zip.file(/^word\/media\/.+\.(png|jpe?g)$/i) || []) {
     const bytes = await media.async("uint8array");
     const size = imageSize(bytes);
-    if (size && size.h >= 320 && size.h > size.w * 1.05 && bytes.byteLength > 30000) hasPortrait = true;
-    if (bytes.byteLength >= 20000) images.push(bytes);
+    const portrait = size && size.h >= 320 && size.h > size.w * 1.05 && bytes.byteLength > 30000;
+    if (portrait) hasPortrait = true;
+    if (bytes.byteLength >= 20000 && !portrait) images.push(bytes);
   }
   return { text: lines.join("\n"), lines, chartGroups, images, hasPortrait };
 }
@@ -444,6 +445,9 @@ function createOcrWorker() {
     workerPath: "https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/worker.min.js",
     corePath: "https://cdn.jsdelivr.net/npm/tesseract.js-core@5.1.1",
     langPath: "https://tessdata.projectnaptha.com/4.0.0_fast",
+  }).then(async (worker) => {
+    await worker.setParameters({ tessedit_pageseg_mode: "6" });
+    return worker;
   });
 }
 
@@ -453,7 +457,7 @@ async function ocrImages(worker, images, onStatus) {
   const lines = [];
   for (let i = 0; i < images.length; i++) {
     onStatus(`正在识别稿里的图片（${i + 1}/${images.length}）…`);
-    const { data } = await worker.recognize(new Blob([images[i]]));
+    const { data } = await worker.recognize(await shrinkForOcr(images[i]));
     const labels = [];
     (data.lines || []).forEach((line) => {
       if (line.confidence < 45) return;
@@ -499,9 +503,47 @@ function takeOcrLines(data, mapBox) {
   return { texts, lines };
 }
 
+function mostlyBlank(canvas) {
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+  const stepX = Math.max(1, Math.floor(canvas.width / 36));
+  const stepY = Math.max(1, Math.floor(canvas.height / 20));
+  let ink = 0;
+  let seen = 0;
+  for (let y = 0; y < canvas.height; y += stepY) {
+    for (let x = 0; x < canvas.width; x += stepX) {
+      const i = (y * canvas.width + x) * 4;
+      if (data[i] + data[i + 1] + data[i + 2] < 700) ink += 1;
+      seen += 1;
+    }
+  }
+  return seen > 0 && ink / seen < 0.012;
+}
+
+async function shrinkForOcr(bytes) {
+  const url = URL.createObjectURL(new Blob([bytes]));
+  try {
+    const image = await new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = () => reject(new Error("稿里的图片没有打开"));
+      img.src = url;
+    });
+    const maxW = 1000;
+    const scale = Math.min(1, maxW / image.width);
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.ceil(image.width * scale));
+    canvas.height = Math.max(1, Math.ceil(image.height * scale));
+    canvas.getContext("2d").drawImage(image, 0, 0, canvas.width, canvas.height);
+    return canvas;
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
 async function ocrCanvasBands(worker, canvas, onStatus, label, mapLine) {
-  const bandH = 1400;
-  const overlap = 80;
+  const bandH = 900;
+  const overlap = 40;
   const texts = [];
   const lines = [];
   const step = bandH - overlap;
@@ -518,6 +560,7 @@ async function ocrCanvasBands(worker, canvas, onStatus, label, mapLine) {
       target.height = h;
       target.getContext("2d").drawImage(canvas, 0, y, canvas.width, h, 0, 0, canvas.width, h);
     }
+    if (mostlyBlank(target)) continue;
     const { data } = await worker.recognize(target);
     const got = takeOcrLines(data, (box) => mapLine(box, y));
     texts.push(...got.texts);
@@ -527,7 +570,7 @@ async function ocrCanvasBands(worker, canvas, onStatus, label, mapLine) {
 }
 
 async function ocrImageElement(worker, image, onStatus) {
-  const maxW = 1400;
+  const maxW = 1000;
   const scale = Math.min(1, maxW / image.width);
   const canvas = document.createElement("canvas");
   canvas.width = Math.max(1, Math.ceil(image.width * scale));
@@ -548,7 +591,7 @@ async function ocrPdfPages(worker, pdfDoc, onStatus) {
   for (let i = 1; i <= pdfDoc.numPages; i++) {
     const page = await pdfDoc.getPage(i);
     const base = page.getViewport({ scale: 1 });
-    const viewport = page.getViewport({ scale: Math.min(1.4, 1600 / base.width) });
+    const viewport = page.getViewport({ scale: Math.min(1.05, 1100 / base.width) });
     const canvas = document.createElement("canvas");
     canvas.width = Math.ceil(viewport.width);
     canvas.height = Math.ceil(viewport.height);
