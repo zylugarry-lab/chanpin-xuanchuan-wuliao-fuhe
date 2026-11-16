@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>产品宣传物料复核</title>
-  <link rel="stylesheet" href="styles.css" />
+  <link rel="stylesheet" href="styles.css?v=2" />
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 </head>
@@ -14,23 +14,29 @@
       <p class="eyebrow">Word 稿 × PDF 成品</p>
       <h1>产品宣传物料复核</h1>
     </div>
-      <p class="lede">文件只在这台浏览器里处理，不会上传。成品可以是 PDF，也可以是 PNG 或 JPG。少几个字、多一个句号、封面多出来的短句、稿里写了配照片但没有人像、费率表同一档的百分数，都会列出来。整页图片会分段识别，差错旁边显示成品上的那一块。识别看错的字不会单独算一条。</p>
+      <p class="lede">文件只在这台浏览器里处理，不会上传。可以把多份 Word 稿和多份成品拖进来，一次对照。成品可以是 PDF，也可以是 PNG 或 JPG。文件名相近的会配成一对；只有一份稿或一份成品时，会拿它和另一边的每一份对照。少几个字、多一个句号、封面多出来的短句、稿里写了配照片但没有人像、费率表同一档的百分数，都会列出来。整页图片会分段识别，差错旁边显示成品上的那一块。识别看错的字不会单独算一条。</p>
   </header>
 
   <main>
     <section class="picker">
-      <label class="drop" id="word-drop">
-        <span class="drop-kicker">Word 稿</span>
-        <strong id="word-name">选择 .docx</strong>
-        <span class="drop-hint">含修订时按接受后的正文</span>
-        <input id="word-file" type="file" accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document" hidden />
-      </label>
-      <label class="drop" id="pdf-drop">
-        <span class="drop-kicker">PDF 或图片</span>
-        <strong id="pdf-name">选择 PDF、PNG、JPG</strong>
-        <span class="drop-hint">长图会分段识别</span>
-        <input id="pdf-file" type="file" accept=".pdf,.png,.jpg,.jpeg,application/pdf,image/png,image/jpeg" hidden />
-      </label>
+      <div class="slot">
+        <label class="drop" id="word-drop">
+          <span class="drop-kicker">Word 稿</span>
+          <strong id="word-name">选择或拖入 .docx</strong>
+          <span class="drop-hint">可多选。含修订时按接受后的正文</span>
+          <input id="word-file" type="file" accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document" multiple hidden />
+        </label>
+        <ul id="word-list" class="file-list"></ul>
+      </div>
+      <div class="slot">
+        <label class="drop" id="pdf-drop">
+          <span class="drop-kicker">PDF 或图片</span>
+          <strong id="pdf-name">选择或拖入 PDF、PNG、JPG</strong>
+          <span class="drop-hint">可多选。长图会分段识别</span>
+          <input id="pdf-file" type="file" accept=".pdf,.png,.jpg,.jpeg,application/pdf,image/png,image/jpeg" multiple hidden />
+        </label>
+        <ul id="pdf-list" class="file-list"></ul>
+      </div>
     </section>
 
     <div class="actions">
@@ -70,7 +76,7 @@
 
   <div id="lightbox" class="lightbox" hidden></div>
   <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
-  <script src="compare.js"></script>
-  <script src="app.js"></script>
+  <script src="compare.js?v=2"></script>
+  <script src="app.js?v=2"></script>
 </body>
 </html>

@@ -61,9 +61,38 @@ h1 {
 }
 
 .drop.ready { border-color: var(--navy); }
+.drop.dragging { border-color: var(--navy); background: var(--blue); }
 .drop-kicker { color: var(--muted); font-size: 12px; }
 .drop strong { font-size: 16px; font-weight: 600; }
 .drop-hint { color: var(--muted); font-size: 13px; }
+
+.file-list {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.file-list li {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  align-items: center;
+  font-size: 13px;
+}
+.file-list span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-list button {
+  background: transparent;
+  color: var(--navy);
+  border: 0;
+  padding: 0 2px;
+  flex: none;
+}
+tr.group td {
+  background: var(--blue);
+  font-weight: 600;
+}
 
 .actions {
   display: flex;
