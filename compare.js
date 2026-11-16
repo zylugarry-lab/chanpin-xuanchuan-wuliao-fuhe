@@ -123,6 +123,47 @@ function unreadableCount(text) {
   return (norm(text).match(UNREADABLE) || []).length;
 }
 
+function digitStandIns(wordText, pdfText) {
+  const wordChars = new Set(String(wordText || ""));
+  const counts = new Map();
+  for (const ch of String(pdfText || "")) {
+    if (!/[\u4e00-\u9fff]/.test(ch) || wordChars.has(ch)) continue;
+    counts.set(ch, (counts.get(ch) || 0) + 1);
+  }
+  const stand = new Set();
+  counts.forEach((count, ch) => {
+    if (count >= 6) stand.add(ch);
+  });
+  if (stand.size < 6) return new Set();
+  const beside = new Map();
+  const apart = new Map();
+  const pdf = String(pdfText || "");
+  for (let i = 0; i < pdf.length; i++) {
+    const ch = pdf[i];
+    if (!/[\u4e00-\u9fff]/.test(ch) || stand.has(ch) || !wordChars.has(ch)) continue;
+    const prev = pdf[i - 1] || "";
+    const next = pdf[i + 1] || "";
+    const close = stand.has(prev) || stand.has(next) || /[\d.%]/.test(prev) || /[\d.%]/.test(next);
+    const bag = close ? beside : apart;
+    bag.set(ch, (bag.get(ch) || 0) + 1);
+  }
+  beside.forEach((count, ch) => {
+    if (count >= 4 && count > (apart.get(ch) || 0) * 2) stand.add(ch);
+  });
+  return stand;
+}
+
+function digitFontCovered(needle, haystack, stand) {
+  if (!stand || !stand.size) return false;
+  const side = norm(needle);
+  const finished = norm(haystack);
+  const usesStand = [...side, ...finished].some((ch) => stand.has(ch));
+  if (!usesStand) return false;
+  const mask = (text) => [...text].map((ch) => (/\d/.test(ch) || stand.has(ch) ? "#" : ch)).join("");
+  const left = mask(side);
+  return left.length >= 8 && mask(finished).includes(left);
+}
+
 function noisyExtra(raw, wordBlob) {
   const marks = unreadableCount(raw);
   const separated = norm(String(raw || "").replace(UNREADABLE, ","));
@@ -1007,6 +1048,7 @@ function compare(word, pdf, ocrGroups) {
   const wn = norm(wordText);
   const pn = norm(pdfText);
   const wnWithOcr = norm(wordText + "\n" + ocrText);
+  const stand = digitStandIns(wordText, pdfText + "\n" + pdfOcr);
   const findings = [];
   const seen = new Set();
 
@@ -1250,6 +1292,7 @@ function compare(word, pdf, ocrGroups) {
     }
     if (pn.includes(n)) return;
     if (headingSplitOnly(n, pdfText, pn)) return;
+    if (digitFontCovered(n, pdfText, stand)) return;
     const bare = punctBare(n);
     const pair = pdfSentenceList.find((item) => punctBare(item.n) === bare && item.n !== n);
     if (pair && bare.length >= 8) {
@@ -1263,6 +1306,7 @@ function compare(word, pdf, ocrGroups) {
     if (best && best.same >= 0.82 && best.markCount >= 1 && best.markCount <= 12) {
       if (edgeLabelOnly(n, best.diff.aMarks, pn)) return;
       if (punctuationAfterOwnHeading(n, best.diff.aMarks, pdfText)) return;
+      if (digitFontCovered(n, best.right, stand)) return;
       pushSentence(
         "正文不一致",
         raw,
@@ -1277,13 +1321,35 @@ function compare(word, pdf, ocrGroups) {
       if (scan) return;
       const core = n.replace(/[-—–_=|·•]/g, "");
       if (core.length >= 2 && pn.includes(core)) return;
-      const logo = raw.replace(/\s/g, "").replace(/公司LOGO|固收品牌LOGO|指享增强LOGO|品牌LOGO|广告|\|/g, "");
-      if (logo.length === 0) return;
+      const logo = raw.replace(/\s/g, "").replace(/公司LOGO|固收品牌LOGO|指享增强LOGO|FOF品牌LOGO|品牌LOGO|广告|[|丨]/g, "");
+      if (/^[A-Za-z]*$/.test(logo)) return;
       if (blobHasDate(pdfText + "\n" + pdfOcr, dateKey(raw))) return;
       if (/[附配]照片/.test(raw)) {
         const core = n.replace(/[（(]?[附配]照片[)）]?/g, "");
         if (core.length < 4 || pn.includes(core)) return;
+        const name = (raw.match(/[\u4e00-\u9fff]{2,4}/g) || []).find((part) => part !== "基金经理" && part !== "照片");
+        if (name && pn.includes(name)) return;
       }
+      const codes = n.match(/^A类:?(\d{6})C类:?(\d{6})$/);
+      if (codes) {
+        const hit = (pdfText + "\n" + pdfOcr).match(new RegExp("A\\s*[:：]\\s*" + codes[1] + "[\\s\\S]{0,16}C\\s*[:：]\\s*" + codes[2]));
+        if (hit) {
+          pushSentence("正文不一致", raw.trim(), hit[0].replace(/\s+/g, " "), "份额代码数字一样。成品没有写「类」。");
+          return;
+        }
+      }
+      if (digitFontCovered(n, pdfText, stand)) return;
+      const pieces = n.split(/[,:；（）()]/).filter((part) => part.length >= 6);
+      if (pieces.length >= 2 && pieces.every((part) => pn.includes(part) || digitFontCovered(part, pdfText, stand))) return;
+      if (String(pdfText).split(/\n/).some((line) => {
+        const text = norm(line);
+        if (text.length < 4 || text.length > 10 || wn.includes(text)) return false;
+        for (let i = 0; i < text.length; i++) {
+          const shorter = text.slice(0, i) + text.slice(i + 1);
+          if (shorter.length >= 4 && n.startsWith(shorter)) return true;
+        }
+        return n.startsWith(text.slice(2)) && text.length - 2 >= 2;
+      })) return;
       pushSentence("稿有成品无", raw, "（成品文字层里没有这句）", "稿里有，成品文字层里对不上。转曲标题可能其实印在版面上。");
     }
   });
@@ -1301,6 +1367,7 @@ function compare(word, pdf, ocrGroups) {
       });
       if (already) return;
       if (sameYearMonthAlreadyInWord(n, wordText)) return;
+      if (digitFontCovered(n, wordText + "\n" + ocrText, stand)) return;
       const ocrLabels = (ocrText.match(/[\u4e00-\u9fff]{4,}/g) || []).map((label) => norm(label));
       const shared = ocrLabels.filter((label) => n.includes(label)).length;
       if (shared >= 2) return;
@@ -1527,6 +1594,38 @@ function compare(word, pdf, ocrGroups) {
     });
     if (!best) return;
     push("正文不一致", left, best.raw, "这几个字对不上。请核对是不是指数、产品或名称写错。");
+  });
+
+  const amountOf = (line) => {
+    const matched = norm(line).match(/^([+\-]?\d+(?:\.\d+)?)(亿元|万元|元\/笔|%\/年)$/);
+    return matched ? { num: matched[1], unit: matched[2], raw: String(line).trim() } : null;
+  };
+  const wordAmounts = (word.lines || []).map(amountOf).filter(Boolean);
+  const pdfAmounts = otherLines.map(amountOf).filter(Boolean);
+  wordAmounts.forEach((left) => {
+    if (norm(pdfText + "\n" + pdfOcr).includes(norm(left.raw))) return;
+    const rivals = pdfAmounts.filter((right) => right.unit === left.unit && !norm(wordText).includes(norm(right.raw)));
+    if (rivals.length !== 1 || rivals[0].num === left.num) return;
+    push("正文不一致", left.raw, rivals[0].raw, "单位一样，数字不一样。请核对规模或金额。");
+  });
+
+  String(pdfText).split(/\n/).forEach((raw) => {
+    const n = norm(raw);
+    if ([...n].some((ch) => stand.has(ch))) return;
+    if (!/^[\u4e00-\u9fff]{4,8}$/.test(n) || wn.includes(n)) return;
+    for (let i = 0; i < n.length; i++) {
+      const shorter = n.slice(0, i) + n.slice(i + 1);
+      if (shorter.length < 4) continue;
+      const host = (word.lines || []).find((line) => norm(line).startsWith(shorter));
+      if (!host) continue;
+      push("正文不一致", String(host).trim().slice(0, 24), raw.trim(), "这里多了一个「" + n[i] + "」。");
+      return;
+    }
+    const tail = n.slice(2);
+    const host = (word.lines || []).find((line) => norm(line).startsWith(tail));
+    if (tail.length >= 2 && host) {
+      push("正文不一致", String(host).trim().slice(0, 24), raw.trim(), "成品在这几个字前面多了「" + n.slice(0, 2) + "」。");
+    }
   });
 
   (word.lines || []).forEach((line) => {
