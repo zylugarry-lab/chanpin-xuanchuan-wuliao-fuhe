@@ -127,6 +127,92 @@ function hideUnreadable(text) {
     .trim();
 }
 
+function hanEdge(text, fromEnd) {
+  const folded = norm(text);
+  const matched = fromEnd ? folded.match(/[\u4e00-\u9fff]{2,6}$/) : folded.match(/^[\u4e00-\u9fff]{2,6}/);
+  return matched ? matched[0] : "";
+}
+
+function restoreUnreadDigits(pdfText, codes, wordText) {
+  const src = String(pdfText || "");
+  const marks = [...src].filter((ch) => UNREADABLE_CHAR.test(ch));
+  const list = Array.isArray(codes) ? codes : [];
+  if (!marks.length || list.length !== marks.length) return { text: src, map: new Map() };
+  const word = norm(wordText || "");
+  const votes = new Map();
+  function vote(code, digit) {
+    if (!votes.has(code)) votes.set(code, new Map());
+    const bag = votes.get(code);
+    bag.set(digit, (bag.get(digit) || 0) + 1);
+  }
+  let cursor = 0;
+  let at = 0;
+  while (at < src.length) {
+    if (!UNREADABLE_CHAR.test(src[at])) {
+      at += 1;
+      continue;
+    }
+    const start = at;
+    while (at < src.length && UNREADABLE_CHAR.test(src[at])) at += 1;
+    const run = list.slice(cursor, cursor + (at - start)).map((code) => Number(code));
+    cursor = cursor + run.length;
+    const left = hanEdge(src.slice(Math.max(0, start - 16), start), true);
+    const right = hanEdge(src.slice(at, at + 16), false);
+    if (left) {
+      const found = new Set();
+      let from = 0;
+      while (from < word.length) {
+        const hit = word.indexOf(left, from);
+        if (hit < 0) break;
+        const digits = (word.slice(hit + left.length).match(/^\d+/) || [""])[0];
+        if (digits.length === run.length) found.add(digits);
+        from = hit + left.length;
+      }
+      if (found.size === 1) [...found][0].split("").forEach((digit, index) => vote(run[index], digit));
+    }
+    if (right) {
+      const found = new Set();
+      let from = 0;
+      while (from < word.length) {
+        const hit = word.indexOf(right, from);
+        if (hit < 0) break;
+        const digits = (word.slice(0, hit).match(/\d+$/) || [""])[0];
+        if (digits.length === run.length) found.add(digits);
+        from = hit + right.length;
+      }
+      if (found.size === 1) [...found][0].split("").forEach((digit, index) => vote(run[index], digit));
+    }
+  }
+  const map = new Map();
+  votes.forEach((bag, code) => {
+    const ranked = [...bag.entries()].sort((a, b) => b[1] - a[1]);
+    if (ranked.length === 1 || ranked[0][1] >= ranked[1][1] * 2) map.set(code, ranked[0][0]);
+  });
+  const known = [...map.entries()].map(([code, digit]) => ({ code, digit: Number(digit) }));
+  if (known.length >= 2) {
+    const bases = new Map();
+    known.forEach((item) => {
+      const base = item.code - item.digit;
+      bases.set(base, (bases.get(base) || 0) + 1);
+    });
+    const [base, count] = [...bases.entries()].sort((a, b) => b[1] - a[1])[0];
+    if (count >= 2 && count >= known.length * 0.6) {
+      map.clear();
+      list.forEach((code) => {
+        const digit = Number(code) - base;
+        if (digit >= 0 && digit <= 9) map.set(Number(code), String(digit));
+      });
+    }
+  }
+  let index = 0;
+  const text = [...src].map((ch) => {
+    if (!UNREADABLE_CHAR.test(ch)) return ch;
+    const digit = map.get(Number(list[index++]));
+    return digit != null ? digit : ch;
+  }).join("");
+  return { text, map };
+}
+
 function unreadableCount(text) {
   return (norm(text).match(UNREADABLE) || []).length;
 }
@@ -1718,5 +1804,6 @@ if (typeof module !== "undefined" && module.exports) {
     locateCluster,
     acceptTrackChanges,
     pictureEdits,
+    restoreUnreadDigits,
   };
 }

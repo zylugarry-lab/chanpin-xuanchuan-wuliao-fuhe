@@ -244,6 +244,26 @@ async function comparePair(wordFile, pdfFile, title, ensureWorker) {
     readDocx(wordFile),
     isImageFile(finished) ? readImageFile(finished) : readPdf(finished),
   ]);
+  if (!pdf.image && pdf.doc && /\uFFFD/.test(pdf.text)) {
+    statusEl.textContent = `${title}：正在辨认成品里的数字…`;
+    try {
+      const codes = await unreadDigitCodes(pdf.doc);
+      const restored = restoreUnreadDigits(pdf.text, codes, word.text);
+      if (restored.text !== pdf.text) {
+        pdf.text = restored.text;
+        const itemMarks = pdf.items.reduce((sum, item) => sum + (item.str.match(/\uFFFD/g) || []).length, 0);
+        if (itemMarks === codes.length) {
+          let index = 0;
+          pdf.items.forEach((item) => {
+            item.str = item.str.replace(/\uFFFD/g, () => {
+              const digit = restored.map.get(codes[index++]);
+              return digit != null ? digit : "\uFFFD";
+            });
+          });
+        }
+      }
+    } catch (err) {}
+  }
   const scan = pdf.text.replace(/\s/g, "").length < 40;
   let ocrGroups = [];
   let warning = "";
@@ -404,6 +424,24 @@ function imageSize(bytes) {
     }
   }
   return null;
+}
+
+async function unreadDigitCodes(pdfDoc) {
+  const ops = (typeof pdfjsLib !== "undefined" && pdfjsLib.OPS) || {};
+  if (ops.showText == null) return [];
+  const codes = [];
+  for (let i = 1; i <= pdfDoc.numPages; i++) {
+    const page = await pdfDoc.getPage(i);
+    const op = await page.getOperatorList();
+    for (let j = 0; j < op.fnArray.length; j++) {
+      if (op.fnArray[j] !== ops.showText) continue;
+      const glyphs = op.argsArray[j][0] || [];
+      for (const glyph of glyphs) {
+        if (glyph && glyph.unicode === "\uFFFD") codes.push(glyph.originalCharCode | 0);
+      }
+    }
+  }
+  return codes;
 }
 
 async function readPdf(file) {
