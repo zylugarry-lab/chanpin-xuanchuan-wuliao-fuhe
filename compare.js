@@ -113,10 +113,18 @@ function extractChartGroups(xml) {
   return groups;
 }
 
-const UNREADABLE = /[◆◇♦▪●□■◻◼�\uFFFD]/g;
+const UNREADABLE_CHAR = /[◆◇♦▪●□■◻◼\uFFFD]/;
+const UNREADABLE = /[◆◇♦▪●□■◻◼\uFFFD]/g;
 
 function stripUnreadable(text) {
   return String(text || "").replace(UNREADABLE, "");
+}
+
+function hideUnreadable(text) {
+  return String(text || "")
+    .replace(/(?:[◆◇♦▪●□■◻◼\uFFFD]+[.．%％]*)+/g, "")
+    .replace(/[ \t]{2,}/g, " ")
+    .trim();
 }
 
 function unreadableCount(text) {
@@ -124,6 +132,10 @@ function unreadableCount(text) {
 }
 
 function digitStandIns(wordText, pdfText) {
+  const unread = new Set();
+  for (const ch of String(pdfText || "")) {
+    if (UNREADABLE_CHAR.test(ch)) unread.add(ch);
+  }
   const wordChars = new Set(String(wordText || ""));
   const counts = new Map();
   for (const ch of String(pdfText || "")) {
@@ -134,7 +146,7 @@ function digitStandIns(wordText, pdfText) {
   counts.forEach((count, ch) => {
     if (count >= 6) stand.add(ch);
   });
-  if (stand.size < 6) return new Set();
+  if (stand.size < 6) return unread;
   const beside = new Map();
   const apart = new Map();
   const pdf = String(pdfText || "");
@@ -150,7 +162,19 @@ function digitStandIns(wordText, pdfText) {
   beside.forEach((count, ch) => {
     if (count >= 4 && count > (apart.get(ch) || 0) * 2) stand.add(ch);
   });
+  unread.forEach((ch) => stand.add(ch));
   return stand;
+}
+
+function onlyUnreadDigitMarks(a, b) {
+  const left = norm(a);
+  const right = norm(b);
+  if (![...left, ...right].some((ch) => UNREADABLE_CHAR.test(ch))) return false;
+  const diff = lcsDiff(left, right);
+  if (!diff) return false;
+  const placeholder = (ch) => /\d/.test(ch) || UNREADABLE_CHAR.test(ch) || ch === "." || ch === "%";
+  const ok = (text, marks) => marks.every((marked, i) => !marked || placeholder(text[i]));
+  return ok(left, diff.aMarks) && ok(right, diff.bMarks);
 }
 
 function digitFontCovered(needle, haystack, stand) {
@@ -1053,6 +1077,11 @@ function compare(word, pdf, ocrGroups) {
   const seen = new Set();
 
   function push(kind, wordSide, pdfSide, note, wordHtml, pdfHtml, extra) {
+    if (onlyUnreadDigitMarks(wordSide, pdfSide)) return;
+    wordSide = hideUnreadable(wordSide);
+    pdfSide = hideUnreadable(pdfSide);
+    if (wordHtml) wordHtml = hideUnreadable(wordHtml);
+    if (pdfHtml) pdfHtml = hideUnreadable(pdfHtml);
     const key = kind + "|" + norm(wordSide) + "|" + norm(pdfSide);
     if (!norm(wordSide) && !norm(pdfSide)) return;
     if (seen.has(key)) {
@@ -1268,6 +1297,11 @@ function compare(word, pdf, ocrGroups) {
 
   const sentenceFindings = [];
   function pushSentence(kind, wordSide, pdfSide, note, wordHtml, pdfHtml) {
+    if (onlyUnreadDigitMarks(wordSide, pdfSide)) return;
+    wordSide = hideUnreadable(wordSide);
+    pdfSide = hideUnreadable(pdfSide);
+    if (wordHtml) wordHtml = hideUnreadable(wordHtml);
+    if (pdfHtml) pdfHtml = hideUnreadable(pdfHtml);
     const key = kind + "|" + norm(wordSide) + "|" + norm(pdfSide);
     if (seen.has(key)) return;
     seen.add(key);
@@ -1306,7 +1340,9 @@ function compare(word, pdf, ocrGroups) {
     if (best && best.same >= 0.82 && best.markCount >= 1 && best.markCount <= 12) {
       if (edgeLabelOnly(n, best.diff.aMarks, pn)) return;
       if (punctuationAfterOwnHeading(n, best.diff.aMarks, pdfText)) return;
-      if (digitFontCovered(n, best.right, stand)) return;
+      if (digitFontCovered(n, best.right, stand) || digitFontCovered(n, pdfText, stand) || onlyUnreadDigitMarks(n, best.right)) return;
+      const pieces = n.split(/[,:；（）()]/).filter((part) => part.length >= 6);
+      if (pieces.length && pieces.every((part) => pn.includes(part) || digitFontCovered(part, pdfText, stand))) return;
       pushSentence(
         "正文不一致",
         raw,
@@ -1372,7 +1408,13 @@ function compare(word, pdf, ocrGroups) {
       const shared = ocrLabels.filter((label) => n.includes(label)).length;
       if (shared >= 2) return;
       if (noisyExtra(raw, wnWithOcr)) return;
-      pushSentence("成品多写", "（稿里没有这句）", raw, "成品文字层里有，稿里没有。图注和脚注经常落在这里。");
+      let shown = raw;
+      if (unreadableCount(raw)) {
+        shown = hideUnreadable(raw);
+        const sn = norm(shown);
+        if (sn.length < 8 || wnWithOcr.includes(sn) || coverage(sn, wnWithOcr) >= 0.62) return;
+      }
+      pushSentence("成品多写", "（稿里没有这句）", shown, "成品文字层里有，稿里没有。图注和脚注经常落在这里。");
     }
   });
 
@@ -1563,6 +1605,7 @@ function compare(word, pdf, ocrGroups) {
     });
     if (!best || norm(line) === norm(best.raw)) return;
     if (norm(wordText).includes(norm(best.raw))) return;
+    if (onlyUnreadDigitMarks(line, best.raw)) return;
     push("正文不一致", String(line).trim(), best.raw, "这几个字几乎一样，少了或多了个别字。");
   });
 
@@ -1593,6 +1636,7 @@ function compare(word, pdf, ocrGroups) {
       if (!best || prefix > best.prefix) best = { raw, prefix };
     });
     if (!best) return;
+    if (onlyUnreadDigitMarks(left, best.raw)) return;
     push("正文不一致", left, best.raw, "这几个字对不上。请核对是不是指数、产品或名称写错。");
   });
 
