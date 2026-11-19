@@ -1443,7 +1443,7 @@ function compare(word, pdf, ocrGroups) {
       if (scan) return;
       const core = n.replace(/[-—–_=|·•]/g, "");
       if (core.length >= 2 && pn.includes(core)) return;
-      const logo = raw.replace(/\s/g, "").replace(/公司LOGO|固收品牌LOGO|指享增强LOGO|FOF品牌LOGO|品牌LOGO|广告|[|丨]/g, "");
+      const logo = raw.replace(/\s/g, "").replace(/[\u4e00-\u9fffA-Za-z]{0,12}LOGO|广告|[|丨]/g, "");
       if (/^[A-Za-z]*$/.test(logo)) return;
       if (blobHasDate(pdfText + "\n" + pdfOcr, dateKey(raw))) return;
       if (/[附配]照片/.test(raw)) {
@@ -1494,6 +1494,13 @@ function compare(word, pdf, ocrGroups) {
       const shared = ocrLabels.filter((label) => n.includes(label)).length;
       if (shared >= 2) return;
       if (noisyExtra(raw, wnWithOcr)) return;
+      const starred = n.replace(/X(?=\d)/g, "*");
+      if (starred !== n && wnWithOcr.includes(starred)) {
+        if (!findings.some((item) => String(item.note || "").includes("字母 X"))) {
+          pushSentence("正文不一致", starred, raw.trim(), "指数和比例一样。成品这处乘号写成了字母 X，稿是 *。");
+        }
+        return;
+      }
       let shown = raw;
       if (unreadableCount(raw)) {
         shown = hideUnreadable(raw);
@@ -1756,6 +1763,38 @@ function compare(word, pdf, ocrGroups) {
     if (tail.length >= 2 && host) {
       push("正文不一致", String(host).trim().slice(0, 24), raw.trim(), "成品在这几个字前面多了「" + n.slice(0, 2) + "」。");
     }
+  });
+
+  (word.lines || []).forEach((line) => {
+    const left = String(line || "").trim();
+    const a = norm(left);
+    if (a.length < 12 || /[.]$/.test(a) || wordBlob.includes(a + ".")) return;
+    let at = otherBlob.indexOf(a);
+    while (at >= 0) {
+      const after = otherBlob[at + a.length];
+      const next = otherBlob[at + a.length + 1];
+      if (after === "." && !(next && /\d/.test(next))) {
+        push("正文不一致", left.length > 42 ? "…" + left.slice(-24) : left, "…。", "这句末尾多了一个句号。字是一样的。");
+        return;
+      }
+      at = otherBlob.indexOf(a, at + 1);
+    }
+  });
+
+  (word.lines || []).forEach((line) => {
+    const left = String(line || "").trim();
+    const a = norm(left);
+    if (a.length < 8 || a.length > 36 || otherBlob.includes(a)) return;
+    let hit = null;
+    otherLines.forEach((raw) => {
+      const b = norm(raw);
+      if (!b || b.length < 6 || !a.endsWith(b)) return;
+      const prefix = a.slice(0, a.length - b.length);
+      if (prefix.length < 2 || prefix.length > 4 || !/^[\u4e00-\u9fff]+$/.test(prefix)) return;
+      if (!hit || b.length > hit.len) hit = { raw: String(raw).trim(), prefix, len: b.length };
+    });
+    if (!hit) return;
+    push("正文不一致", left, hit.raw, "成品这行少了开头的「" + hit.prefix + "」。");
   });
 
   (word.lines || []).forEach((line) => {
