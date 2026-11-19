@@ -1361,14 +1361,28 @@ function compare(word, pdf, ocrGroups) {
     const clause = strictText(endingMatch[1]).slice(-12);
     const punct = endingMatch[2];
     if (clause.length < 6) continue;
-    const at = pdfStrict.indexOf(clause);
-    if (at < 0) continue;
-    const next = pdfStrict[at + clause.length] || "";
     const expected = punct === "。" ? /[。.]/ : /[；;]/;
-    if (expected.test(next)) continue;
     const after = strictText(wordText.slice(endingMatch.index + endingMatch[0].length)).slice(0, 4);
-    const swapped = /[。.;；]/.test(next) && after && pdfStrict.startsWith(after, at + clause.length + 1);
-    const omitted = /[\u4e00-\u9fff]/.test(next) && after && pdfStrict.startsWith(after, at + clause.length);
+    let at = pdfStrict.indexOf(clause);
+    if (at < 0) continue;
+    let swapped = false;
+    let omitted = false;
+    let next = "";
+    while (at >= 0) {
+      next = pdfStrict[at + clause.length] || "";
+      if (expected.test(next)) {
+        swapped = false;
+        omitted = false;
+        break;
+      }
+      if (/[。.;；]/.test(next) && after && pdfStrict.startsWith(after, at + clause.length + 1)) {
+        swapped = true;
+        if (!omitted) next = pdfStrict[at + clause.length] || "";
+      }
+      if (/[\u4e00-\u9fff]/.test(next) && after && pdfStrict.startsWith(after, at + clause.length)) omitted = true;
+      at = pdfStrict.indexOf(clause, at + clause.length);
+    }
+    if (at >= 0) continue;
     if (!swapped && !omitted) continue;
     push(
       "正文不一致",
@@ -1454,6 +1468,11 @@ function compare(word, pdf, ocrGroups) {
       }
       const codes = n.match(/^A类:?(\d{6})C类:?(\d{6})$/);
       if (codes) {
+        const moved = (pdfText + "\n" + pdfOcr).match(new RegExp("A类\\s*" + codes[1] + "\\s*[:：]\\s*C类\\s*" + codes[2]));
+        if (moved) {
+          pushSentence("正文不一致", raw.trim(), moved[0].replace(/\s+/g, " "), "份额代码数字一样。成品把冒号放在了两个代码中间。");
+          return;
+        }
         const hit = (pdfText + "\n" + pdfOcr).match(new RegExp("A\\s*[:：]\\s*" + codes[1] + "[\\s\\S]{0,16}C\\s*[:：]\\s*" + codes[2]));
         if (hit) {
           pushSentence("正文不一致", raw.trim(), hit[0].replace(/\s+/g, " "), "份额代码数字一样。成品没有写「类」。");
@@ -1796,6 +1815,34 @@ function compare(word, pdf, ocrGroups) {
     if (!hit) return;
     push("正文不一致", left, hit.raw, "成品这行少了开头的「" + hit.prefix + "」。");
   });
+
+  otherLines.forEach((raw) => {
+    const b = norm(raw);
+    if (b.length < 6 || b.length > 24 || wordBlob.includes(b)) return;
+    let hit = null;
+    (word.lines || []).forEach((line) => {
+      const a = norm(line);
+      if (a.length < 4 || a.length > 16 || !b.endsWith(a)) return;
+      const prefix = b.slice(0, b.length - a.length);
+      if (prefix.length < 2 || prefix.length > 6 || !/^[\u4e00-\u9fff:]+$/.test(prefix)) return;
+      if (!hit || a.length > hit.len) hit = { left: String(line).trim(), prefix, len: a.length };
+    });
+    if (!hit) return;
+    push("正文不一致", hit.left, String(raw).trim(), "成品在这几个字前面多了「" + hit.prefix.replace(/:/g, "：") + "」。");
+  });
+
+  const droppedNumbers = [];
+  (word.lines || []).forEach((line) => {
+    const left = String(line || "").trim();
+    const numbered = left.match(/^(\d{1,2})[.、．]\s*(.{4,})/);
+    if (!numbered) return;
+    if (otherBlob.includes(norm(left))) return;
+    const rest = norm(numbered[2]);
+    if (rest.length >= 6 && otherBlob.includes(rest.slice(0, Math.min(12, rest.length)))) droppedNumbers.push(numbered[1]);
+  });
+  if (droppedNumbers.length >= 2) {
+    push("正文不一致", droppedNumbers.map((n) => n + ".").join("、"), "（这几条没有序号）", "这几条正文都在。成品没有印序号。");
+  }
 
   (word.lines || []).forEach((line) => {
     const left = String(line || "").trim();
