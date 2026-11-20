@@ -1785,7 +1785,7 @@ function compare(word, pdf, ocrGroups) {
   });
 
   (word.lines || []).forEach((line) => {
-    const left = String(line || "").trim();
+    const left = String(line || "").trim().replace(/^[^\u4e00-\u9fff0-9A-Za-z（(]+/, "");
     const a = norm(left);
     if (a.length < 12 || /[.]$/.test(a) || wordBlob.includes(a + ".")) return;
     let at = otherBlob.indexOf(a);
